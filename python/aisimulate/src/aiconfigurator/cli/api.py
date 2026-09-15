@@ -13,6 +13,7 @@ This module provides simple function interfaces to the CLI's "default", "exp",
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 
 import pandas as pd
@@ -53,6 +54,21 @@ from aiconfigurator.sdk.task_v2 import Task
 DEFAULT_PREFILL_LATENCY_CORRECTION_SCALE = 1.1
 DEFAULT_DECODE_LATENCY_CORRECTION_SCALE = 1.08
 POWER_DATA_COVERAGE_THRESHOLD = 0.9
+
+
+def _validate_gpu_hour_price(value: float | None) -> float | None:
+    """Validate the optional price accepted by the programmatic API."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise TypeError(f"gpu_hour_price must be a positive finite number, got {value!r}.")
+    try:
+        price = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"gpu_hour_price must be a positive finite number, got {value!r}.") from exc
+    if not math.isfinite(price) or price <= 0:
+        raise ValueError(f"gpu_hour_price must be a positive finite number, got {value!r}.")
+    return price
 
 
 def cli_support(
@@ -139,6 +155,7 @@ def _execute_and_wrap_result(
     target_request_rate: float | None = None,
     target_concurrency: float | None = None,
     parallel_experiments: bool = False,
+    gpu_hour_price: float | None = None,
 ) -> CLIResult:
     """Execute task configs using main.py's function and wrap result in CLIResult."""
     chosen_exp, best_configs, pareto_fronts, best_throughputs, best_latencies, outcomes = _execute_tasks_internal(
@@ -149,6 +166,7 @@ def _execute_and_wrap_result(
         target_request_rate=target_request_rate,
         target_concurrency=target_concurrency,
         parallel_experiments=parallel_experiments,
+        gpu_hour_price=gpu_hour_price,
     )
 
     return CLIResult(
@@ -205,6 +223,7 @@ def cli_default(
     attention_backend: str | None = None,
     engine_step_backend: str | None = None,
     forward_model: str | None = None,
+    gpu_hour_price: float | None = None,
 ) -> CLIResult:
     """
     Run the default CLI mode: compare aggregated vs disaggregated serving.
@@ -276,6 +295,8 @@ def cli_default(
         engine_step_backend: Engine-step backend; "rust" (the compiled engine,
             default and only executor) is the only accepted value.
         forward_model: Forward-pass modeling mode ("op_level" or "fpm"). None keeps the default.
+        gpu_hour_price: Optional hourly price per GPU.
+            When set, Top-N results include ``tokens/s/$`` without changing ranking.
 
     Returns:
         CLIResult with chosen experiment, best configs, pareto fronts, and throughputs.
@@ -312,6 +333,8 @@ def cli_default(
         >>> print(result.chosen_exp)  # e.g., 'agg_trtllm' or 'disagg_vllm'
         >>> print(result.best_throughputs)  # Shows all 6 backend/mode combinations
     """
+    gpu_hour_price = _validate_gpu_hour_price(gpu_hour_price)
+
     # Fail fast on inconsistent MTP inputs (same early check as the CLI path).
     # nextn="auto" resolves the draft depth from the checkpoint first.
     if nextn == "auto":
@@ -356,7 +379,13 @@ def cli_default(
         forward_model=forward_model,
     )
 
-    result = _execute_and_wrap_result(tasks, mode="default", top_n=top_n, strict_sla=strict_sla)
+    result = _execute_and_wrap_result(
+        tasks,
+        mode="default",
+        top_n=top_n,
+        strict_sla=strict_sla,
+        gpu_hour_price=gpu_hour_price,
+    )
     if not result.best_configs:
         raise NoFeasibleConfigError("No feasible configurations found for the given parameters.")
 
@@ -465,6 +494,7 @@ def cli_recommend(
     save_dir: str | None = None,
     engine_step_backend: str | None = None,
     forward_model: str | None = None,
+    gpu_hour_price: float | None = None,
 ) -> CLIResult:
     """Find the minimum number of GPUs to meet a performance target.
 
@@ -533,6 +563,8 @@ def cli_recommend(
             default and only executor) is the only accepted value.
         forward_model: Forward-pass modeling mode ("op_level" or "fpm").
             None keeps the default.
+        gpu_hour_price: Optional hourly price per GPU.
+            When set, Top-N results include ``tokens/s/$`` without changing ranking.
 
     Returns:
         CLIResult with best configs containing ``total_gpus_needed`` and
@@ -551,6 +583,8 @@ def cli_recommend(
     import math
 
     from aiconfigurator.sdk.perf_database import load_system_spec
+
+    gpu_hour_price = _validate_gpu_hour_price(gpu_hour_price)
 
     has_rate = target_request_rate is not None
     has_conc = target_concurrency is not None
@@ -630,6 +664,7 @@ def cli_recommend(
             target_request_rate=target_request_rate,
             target_concurrency=target_concurrency,
             parallel_experiments=True,
+            gpu_hour_price=gpu_hour_price,
         )
         retriable = [
             name
@@ -697,6 +732,7 @@ def cli_exp(
     attention_backend: str | None = None,
     top_n: int = 5,
     save_dir: str | None = None,
+    gpu_hour_price: float | None = None,
 ) -> CLIResult:
     """
     Run multiple experiments defined by YAML file or dict config.
@@ -716,6 +752,8 @@ def cli_exp(
             entries in the YAML/config take precedence.
         top_n: Number of top configurations to return for each experiment. Default is 5.
         save_dir: Directory to save results. If None, results are not saved to disk.
+        gpu_hour_price: Optional hourly price per GPU.
+            When set, Top-N results include ``tokens/s/$`` without changing ranking.
 
     Returns:
         CLIResult with chosen experiment, best configs, pareto fronts, and throughputs.
@@ -772,6 +810,8 @@ def cli_exp(
           backend_name: trtllm
           total_gpus: 16
     """
+    gpu_hour_price = _validate_gpu_hour_price(gpu_hour_price)
+
     tasks = build_experiment_tasks(
         yaml_path=yaml_path,
         config=config,
@@ -781,7 +821,7 @@ def cli_exp(
     if not tasks:
         raise ValueError("No valid experiments found in configuration.")
 
-    result = _execute_and_wrap_result(tasks, mode="exp", top_n=top_n)
+    result = _execute_and_wrap_result(tasks, mode="exp", top_n=top_n, gpu_hour_price=gpu_hour_price)
     if not result.best_configs:
         raise NoFeasibleConfigError("No feasible configurations found for the given experiments.")
 
