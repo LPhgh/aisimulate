@@ -1117,6 +1117,8 @@ def cli_estimate(
     afd_phase: str = "decode",
     afd_combined_with_pd: bool = True,
     afd_boundary_on_attn: bool = True,
+    afd_a_system_name: str | None = None,
+    afd_f_system_name: str | None = None,
 ) -> EstimateResult:
     """
     Estimate TTFT, TPOT, and power for a single model/system/config combination.
@@ -1254,6 +1256,11 @@ def cli_estimate(
             ``logits_gemm``) to the A-Worker when True (default); set False to
             place them on the F-Worker. Inverse of the CLI ``--boundary-on-ffn``
             flag.
+        afd_a_system_name: (afd-only) Hardware for the A (attention) pool.
+            Defaults to ``system_name``.
+        afd_f_system_name: (afd-only) Hardware for the F (FFN/MoE) pool;
+            defaults to the A pool. Naming a different device here models
+            heterogeneous AFD.
 
     Returns:
         EstimateResult with ttft, tpot, power_w, mode, and the full raw result dict.
@@ -1315,6 +1322,11 @@ def cli_estimate(
             set_systems_paths(previous_systems_paths)
 
     def _resolve_version_for(sys_name: str) -> str:
+        """Latest DB version for one system.
+
+        Uses the top-level ``backend_version`` when the user pinned it,
+        otherwise queries the latest version for ``sys_name`` + ``backend_name``.
+        """
         resolved_version = backend_version
         if resolved_version is None:
             if active_systems_paths is None:
@@ -1597,6 +1609,8 @@ def cli_estimate(
             prefix=prefix,
             nextn=nextn,
             nextn_accepted=nextn_accepted,
+            afd_a_system_name=afd_a_system_name,
+            afd_f_system_name=afd_f_system_name,
         )
         # ``phase == "both"`` covers prefill+decode inside AFD; no static
         # complement is needed. When ``combined_with_pd`` is False the
@@ -2393,6 +2407,8 @@ def _run_afd_estimate(
     prefix: int = 0,
     nextn: int = 0,
     nextn_accepted: float | None = None,
+    afd_a_system_name: str | None = None,
+    afd_f_system_name: str | None = None,
 ) -> EstimateResult:
     """Run AFD (Attention-FFN Disaggregated) estimation.
 
@@ -2405,6 +2421,12 @@ def _run_afd_estimate(
     ``gpus_per_node`` is pulled from ``database.system_spec`` and is
     therefore not a parameter; ``f_tp_size`` is derived (Phase 1:
     F-DP=1) inside ``AFDConfig.__post_init__``.
+
+    ``afd_a_system_name`` / ``afd_f_system_name`` pin the A and F pools to
+    their own hardware; each falls back to ``system_name``, so an estimate
+    that names no pool is homogeneous and unchanged. Both pools share the
+    top-level backend. Cross-pool A2F/F2A traffic is then priced at the
+    slower endpoint.
     """
     from aiconfigurator.sdk.config import AFDConfig, RuntimeConfig
     from aiconfigurator.sdk.inference_session import AFDInferenceSession
@@ -2418,7 +2440,20 @@ def _run_afd_estimate(
     backend = get_backend(backend_name)
     gpus_per_node = int(database.system_spec["node"]["num_gpus_per_node"])
 
-    f_tp_size = n_f_nodes * gpus_per_node
+    # Per-pool hardware. Reuse the shared database when a pool inherits the
+    # top-level system, so the homogeneous path is byte-for-byte identical
+    # (hetero detection downstream is an identity check). Both pools share the
+    # single top-level backend.
+    a_system = afd_a_system_name or system_name
+    f_system = afd_f_system_name or a_system
+
+    a_database = database if a_system == system_name else load_database(a_system)
+    f_database = a_database if f_system == a_system else load_database(f_system)
+
+    a_gpus_per_node = int(a_database.system_spec["node"]["num_gpus_per_node"])
+    f_gpus_per_node = int(f_database.system_spec["node"]["num_gpus_per_node"])
+
+    f_tp_size = n_f_nodes * f_gpus_per_node
 
     # Build model configs for A-Worker and F-Worker.
     # A-Worker: attention-only pool; MoE dims are irrelevant but must satisfy
@@ -2428,8 +2463,8 @@ def _run_afd_estimate(
     if f_moe_ep_size <= 0 or f_tp_size % f_moe_ep_size != 0:
         raise ValueError(
             f"f_moe_ep_size ({f_moe_ep_size}) must be a positive divisor of "
-            f"f_tp_size ({f_tp_size}) (= n_f_nodes * gpus_per_node, "
-            f"n_f_nodes={n_f_nodes}, gpus_per_node={gpus_per_node}) so that "
+            f"f_tp_size ({f_tp_size}) (= n_f_nodes * f_gpus_per_node, "
+            f"n_f_nodes={n_f_nodes}, f_gpus_per_node={f_gpus_per_node}) so that "
             "f_moe_tp = f_tp / f_moe_ep is an integer."
         )
     f_moe_tp_size = f_tp_size // f_moe_ep_size
@@ -2481,6 +2516,8 @@ def _run_afd_estimate(
         n_a_nodes=n_a_nodes,
         n_f_nodes=n_f_nodes,
         gpus_per_node=gpus_per_node,
+        a_gpus_per_node=a_gpus_per_node,
+        f_gpus_per_node=f_gpus_per_node,
         tp_a=a_tp_size,
         # tp_f is derived inside AFDConfig (Phase 1: F-DP=1).
         f_moe_ep_size=f_moe_ep_size,
@@ -2503,9 +2540,12 @@ def _run_afd_estimate(
         model_path=model_path,
         a_model_config=a_model_config,
         f_model_config=f_model_config,
-        database=database,
+        database=a_database,
         backend=backend,
         afd_config=afd_config,
+        f_database=f_database,
+        a_system_name=a_system,
+        f_system_name=f_system,
     )
     summary = session.run_afd(
         runtime_config,
