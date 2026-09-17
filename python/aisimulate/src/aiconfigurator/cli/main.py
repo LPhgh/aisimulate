@@ -359,6 +359,26 @@ def _add_attention_backend_argument(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _parse_afd_max_af_ratio(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("AFD max A:F node ratio must be a positive number.") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("AFD max A:F node ratio must be a positive number.")
+    return parsed
+
+
+def _parse_afd_f_latency_scale(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("AFD F-pool latency scale must be a positive number.") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("AFD F-pool latency scale must be a positive number.")
+    return parsed
+
+
 # AFD runs up to three pools: a static prefill pool (when combined with P/D),
 # the A (attention) pool and the F (FFN/MoE) pool. Each can be pinned to its
 # own hardware; anything left unset inherits --system. All pools share the
@@ -498,8 +518,30 @@ def _add_default_mode_arguments(parser):
     parser.add_argument(
         "--afd-max-candidates",
         type=_parse_afd_max_candidates,
-        default=10_000,
-        help="[expert] Maximum number of AFD topology candidates. Default: 10000.",
+        default=20_000,
+        help="[expert] Maximum number of AFD topology candidates. Default: 20000.",
+    )
+    parser.add_argument(
+        "--afd-max-af-ratio",
+        type=_parse_afd_max_af_ratio,
+        default=None,
+        help="[expert] Cap the AFD A:F node ratio. Unset means no cap beyond the GPU budget, "
+        "which is what measured AFD optima need (FastAFD reports 7:1-17:1 on GB200 NVL72).",
+    )
+    parser.add_argument(
+        "--afd-router-on-attn",
+        action="store_true",
+        default=False,
+        help="[expert] Assign the MoE router to the A pool, matching the FastAFD boundary. "
+        "Default keeps routing on the F pool; transfer volume is unchanged either way.",
+    )
+    parser.add_argument(
+        "--afd-f-latency-scale",
+        type=_parse_afd_f_latency_scale,
+        default=1.0,
+        help="[expert] Multiply every F-side contribution (MoE compute, router, intra-node AG/RS) to "
+        "calibrate T_e against a specific FFN runtime. Use ~0.3-0.5 to emulate a fused MegaMoE-style "
+        "kernel (FastAFD measured 42-44%% lower step latency). Default: 1.0 (no calibration).",
     )
     parser.add_argument(
         "--afd-candidate-overflow",
@@ -1354,6 +1396,21 @@ def _add_estimate_mode_arguments(parser):
         default=False,
         help="Assign boundary ops (add_norm_2, logits_gemm) to F-Worker. Default is A-Worker; pass this flag to flip.",
     )
+    parser.add_argument(
+        "--router-on-attn",
+        action="store_true",
+        default=False,
+        help="Assign the MoE router to the A-Worker, matching the FastAFD boundary (routed tokens cross the "
+        "pool boundary). Default keeps routing on the F-Worker. Transfer volume is unchanged either way.",
+    )
+    parser.add_argument(
+        "--f-latency-scale",
+        type=float,
+        default=1.0,
+        help="Multiply every F-side contribution (MoE compute, router, intra-node AG/RS) to calibrate the "
+        "predicted T_e against a specific FFN runtime. Use ~0.3-0.5 to emulate a fused MegaMoE-style kernel "
+        "versus stock per-op data (FastAFD measured 42-44% lower step latency). Default: 1.0 (no calibration).",
+    )
     _add_afd_pool_arguments(
         parser,
         pools=_AFD_ESTIMATE_POOL_FLAGS,
@@ -1805,7 +1862,10 @@ def build_default_tasks(
     forward_model: str | None = None,
     serving_mode: str = "auto",
     afd_max_a_batch_size: int = 1024,
-    afd_max_candidates: int = 10_000,
+    afd_max_candidates: int = 20_000,
+    afd_max_af_ratio: float | None = None,
+    afd_router_on_attn: bool = False,
+    afd_f_latency_scale: float = 1.0,
     afd_candidate_overflow: str = "error",
     video_height: int = 0,
     video_width: int = 0,
@@ -1859,6 +1919,9 @@ def build_default_tasks(
             ``"all"`` also includes AFD, and an explicit mode builds only that mode.
         afd_max_a_batch_size: Maximum attention batch size considered by AFD.
         afd_max_candidates: Maximum AFD candidates to enumerate.
+        afd_max_af_ratio: Cap on the AFD A:F node ratio. ``None`` (default)
+            means no cap beyond the GPU budget; measured AFD optima sit at
+            7:1-17:1 (FastAFD, GB200 NVL72), which a cap would hide.
         afd_pools: Per-pool hetero system overrides for AFD mode, as Task field
             names (``afd_{prefill,a,f}_system_name``). Only the keys the user
             set are present; each missing pool inherits ``system``. All pools
@@ -2118,6 +2181,9 @@ def build_default_tasks(
                     moe_backend=backend_moe,
                     afd_max_a_batch_size=afd_max_a_batch_size,
                     afd_max_candidates=afd_max_candidates,
+                    afd_max_af_ratio=afd_max_af_ratio,
+                    afd_router_on_attn=afd_router_on_attn,
+                    afd_f_latency_scale=afd_f_latency_scale,
                     afd_candidate_overflow=afd_candidate_overflow,
                     # Per-pool hetero overrides; empty dict == fully homogeneous.
                     **(afd_pools or {}),
@@ -3029,6 +3095,8 @@ def _run_estimate_mode(args):
             afd_phase=args.afd_phase,
             afd_combined_with_pd=getattr(args, "afd_combined_with_pd", True),
             afd_boundary_on_attn=not getattr(args, "boundary_on_ffn", False),
+            afd_router_on_attn=getattr(args, "router_on_attn", False),
+            afd_f_latency_scale=getattr(args, "f_latency_scale", 1.0),
             **_collect_afd_pool_kwargs(
                 args,
                 pools=_AFD_ESTIMATE_POOL_FLAGS,
@@ -3492,7 +3560,10 @@ def main(args):
             forward_model=args.forward_model,
             serving_mode=args.serving_mode,
             afd_max_a_batch_size=getattr(args, "afd_max_a_batch_size", 1024),
-            afd_max_candidates=getattr(args, "afd_max_candidates", 10_000),
+            afd_max_candidates=getattr(args, "afd_max_candidates", 20_000),
+            afd_max_af_ratio=getattr(args, "afd_max_af_ratio", None),
+            afd_router_on_attn=getattr(args, "afd_router_on_attn", False),
+            afd_f_latency_scale=getattr(args, "afd_f_latency_scale", 1.0),
             afd_candidate_overflow=getattr(args, "afd_candidate_overflow", "error"),
             afd_pools=_collect_afd_pool_kwargs(args),
             enable_wideep=getattr(args, "enable_wideep", False),

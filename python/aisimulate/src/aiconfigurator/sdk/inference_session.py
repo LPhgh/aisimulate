@@ -955,10 +955,125 @@ class DisaggInferenceSession:
         return disagg_summary
 
 
+def _is_moe_dispatch_op(op) -> bool:
+    """True for the model-internal MoE dispatch/combine all-to-all."""
+    return "dispatch" in str(getattr(op, "_name", "")).lower()
+
+
+def _strip_moe_dispatch_from_partition(partition):
+    """Return ``partition`` with MoE dispatch ops removed, OverlapOps included.
+
+    Under AFD the model-internal MoE dispatch all-to-all *is* the cross-pool
+    A<->F transfer; it does not run in addition to it. Leaving it in the F pool
+    bills the same bytes twice -- once as F compute, once as ``t_a2f``/``t_f2a``.
+
+    ``build_afd_ops_partition`` drops a bare ``MoEDispatch`` via its skip list,
+    but one nested inside an ``OverlapOp`` survives because the skip marker only
+    affects that op's classification vote -- ``OverlapOp.query()`` still sums it
+    into the F-pool latency. Rebuild such OverlapOps without the dispatch legs.
+
+    An OverlapOp whose subtree contains no dispatch is returned as-is rather
+    than rebuilt: the sweep walks this path once per candidate per layer, and
+    rebuilding would churn objects for nothing.
+    """
+    from aiconfigurator.sdk import operations
+
+    def _overlap_groups(op):
+        """``(group_a, group_b)`` if ``op`` is an overlap composite, else None.
+
+        Deliberately duck-typed rather than ``isinstance(op, OverlapOp)``.
+        Reading ``_group_a`` off a composite hands back objects rebuilt by the
+        engine, whose type is the *Rust base* ``_core.OverlapOp`` -- not the
+        Python subclass -- so an isinstance check silently skips every nested
+        composite. Upstream's own ``_infer_phase`` / ``_has_leaves`` probe the
+        same attributes for the same reason.
+        """
+        group_a = getattr(op, "_group_a", None)
+        if group_a is None:
+            return None
+        return list(group_a), list(getattr(op, "_group_b", ()) or ())
+
+    def _has_dispatch(op) -> bool:
+        groups = _overlap_groups(op)
+        if groups is None:
+            return _is_moe_dispatch_op(op)
+        return any(_has_dispatch(child) for child in groups[0] + groups[1])
+
+    # Collected by ``rewrite`` as it descends. Scanning ``partition.ffn_ops``
+    # after the fact only sees top-level entries, and on the architectures this
+    # function exists for the dispatch is nested inside an OverlapOp -- so the
+    # audit trail came back empty in exactly the case that matters.
+    stripped: list = []
+
+    def rewrite(op):
+        groups = _overlap_groups(op)
+        if groups is None:
+            if _is_moe_dispatch_op(op):
+                stripped.append(op)
+                return None
+            return op
+        # Leave a clean subtree alone. Object identity cannot be used to detect
+        # "nothing changed" -- the children read back as fresh engine-side
+        # objects every time -- so decide from the subtree's content instead.
+        if not _has_dispatch(op):
+            return op
+        group_a = [o for o in (rewrite(i) for i in groups[0]) if o is not None]
+        group_b = [o for o in (rewrite(i) for i in groups[1]) if o is not None]
+        if not group_a and not group_b:
+            return None
+        return operations.OverlapOp(op._name, group_a, group_b)
+
+    partition.ffn_ops = [o for o in (rewrite(op) for op in partition.ffn_ops) if o is not None]
+    # Make the removal visible, nested cases included: the audit trail used to
+    # say nothing was dropped, which is why this cost went unnoticed inside t_f
+    # for so long.
+    partition.skipped_ops = list(partition.skipped_ops) + stripped
+    return partition
+
+
 # Private helper: bundles the five comm-side ops a single AFD layer needs.
 # Kept module-private; if a second consumer appears in the future, promote
 # to a public dataclass at that point.
 _AFDCommOps = namedtuple("_AFDCommOps", ["a2f", "f2a", "f_ag", "f_rs", "a_combine"])
+
+
+def _is_once_per_step_op(op, num_layers: int) -> bool:
+    """True for ops that run once per step rather than once per layer.
+
+    Models build per-layer ops with ``scale_factor=num_layers`` (qkv_gemm and
+    friends) and once-per-step ops with ``scale_factor=1`` (embedding, logits
+    GEMM), so the field is the discriminator.
+
+    Deliberately wrapped in ``try``: the composite families (``Fallback`` /
+    ``Overlap``) carry no ``scale_factor`` and the pyo3 getter *raises*
+    ``TypeError`` rather than returning ``None``, so a ``getattr`` default
+    would not protect the caller. Those composites are always per-layer
+    bodies, so a raise means per-layer.
+
+    ``num_layers <= 1`` leaves nothing to amortize, so the distinction is moot
+    and every op counts as per-layer -- the caller arithmetic then collapses to
+    its pre-split form.
+    """
+    if num_layers <= 1:
+        return False
+    try:
+        return abs(float(op._scale_factor) - 1.0) < 1e-9
+    except Exception:
+        return False
+
+
+def _split_once_per_step(ops, num_layers: int) -> tuple[list, list]:
+    """Partition ``ops`` into ``(per_layer_ops, once_per_step_ops)``.
+
+    Splitting at the source rather than summing everything and subtracting
+    keeps the two categories from being averaged together, and lets the decode
+    integration evaluate the once-per-step ops a single time instead of once
+    per stride sample.
+    """
+    per_layer, once = [], []
+    for op in ops:
+        (once if _is_once_per_step_op(op, num_layers) else per_layer).append(op)
+    return per_layer, once
 
 
 class AFDInferenceSession:
@@ -988,6 +1103,12 @@ class AFDInferenceSession:
     Memory (HBM) bound is checked for both A-Workers and F-Workers via
     :class:`aiconfigurator.sdk.inference_summary.InferenceSummary`.
     """
+
+    # Class-level default so the dedupe check also works on instances built
+    # without ``__init__`` (test doubles). ``__init__`` shadows it per session
+    # and the warning path assigns an instance attribute, so the suppression
+    # never leaks across sessions.
+    _warned_optimistic_fallback = False
 
     def __init__(
         self,
@@ -1026,6 +1147,10 @@ class AFDInferenceSession:
         self._a_system_name = a_system_name or str(getattr(self._a_database, "system", ""))
         self._f_system_name = f_system_name or str(getattr(self._f_database, "system", ""))
         self._afd_config = afd_config
+        # The optimistic->conservative fallback is evaluated once per decode
+        # stride per candidate, so a sweep would emit the same warning tens of
+        # thousands of times. Report it once per session.
+        self._warned_optimistic_fallback = False
 
     @property
     def is_hetero(self) -> bool:
@@ -1082,7 +1207,11 @@ class AFDInferenceSession:
         """
         ops = list(ops_iter)
         x = batch_size * seq_len if is_context else batch_size
-        db = database if database is not None else self._a_database
+        # ``_a_database`` is the hetero-era primary-pool name; ``_database``
+        # is set to the same object. Resolve either so a caller predating
+        # hetero -- including a session double that only carries the older
+        # attribute -- still works.
+        db = database if database is not None else getattr(self, "_a_database", None) or self._database
 
         rust = self._sum_latency_with_rust(
             ops,
@@ -1120,6 +1249,17 @@ class AFDInferenceSession:
             per_op[op._name] += float(result)
         return sum(per_op.values()), per_op
 
+    def _sum_once_per_step(self, ops, **kwargs):
+        """``(total, per_op)`` for once-per-step ops; ``(0.0, {})`` when none.
+
+        Short-circuits an empty list instead of letting ``_sum_latency`` run it:
+        a no-op query still costs a call, and it would appear in any observation
+        of the query sequence as a phantom evaluation.
+        """
+        if not ops:
+            return 0.0, {}
+        return self._sum_latency(ops, **kwargs)
+
     def _sum_latency_with_rust(
         self,
         ops: list,
@@ -1151,7 +1291,11 @@ class AFDInferenceSession:
             should_use_rust_engine_step,
         )
 
-        db = database if database is not None else self._a_database
+        # ``_a_database`` is the hetero-era primary-pool name; ``_database``
+        # is set to the same object. Resolve either so a caller predating
+        # hetero -- including a session double that only carries the older
+        # attribute -- still works.
+        db = database if database is not None else getattr(self, "_a_database", None) or self._database
 
         if not ops or not should_use_rust_engine_step(runtime_config, db):
             return None
@@ -1321,12 +1465,14 @@ class AFDInferenceSession:
                 name="afd_f_node_allgather",
                 scale_factor=1.0,
                 rank_mapping=rank_mapping,
+                f_moe_tp_size=cfg.f_moe_tp_size,
                 **shared,
             ),
             f_rs=AFDFReduceScatter(
                 name="afd_f_node_reducescatter",
                 scale_factor=1.0,
                 rank_mapping=rank_mapping,
+                f_moe_tp_size=cfg.f_moe_tp_size,
                 **shared,
             ),
             a_combine=AFDCombine(
@@ -1362,8 +1508,15 @@ class AFDInferenceSession:
 
               TPOT_layer = t_a + t_a2f + t_f + t_f2a
 
+          ``num_microbatches < 2`` also lands here regardless of the
+          requested model: with one microbatch in flight there is nothing to
+          overlap.
+
         The optimistic model falls back to conservative when there are
-        not enough in-flight micro-batches to fill the K=3 pipeline.
+        not enough in-flight micro-batches to fill the K=3 pipeline. Since
+        ``min_m`` exceeds 2 whenever the round trip is non-zero, mb=2 always
+        takes that path -- which is why the sweep does not enumerate
+        ``optimistic`` below mb=3.
 
         Returns:
             (t_cycle, comm_hidden).  ``comm_hidden`` is True only in the
@@ -1375,6 +1528,16 @@ class AFDInferenceSession:
         t_c = t_a2f + t_f2a
         if cfg.pipeline_model == "serial":
             return t_a + t_a2f + t_f + t_f2a, False
+        if num_microbatches < 2:
+            # A single in-flight microbatch cannot overlap anything: layer
+            # i+1's A input IS layer i's F output, so the two pools strictly
+            # alternate and neither has work to fill the other's gap. Both
+            # K=3 and K=2 need N_min >= 2, but only the optimistic branch
+            # enforced a threshold -- and its fallback landed on
+            # conservative, which cannot be sustained at mb=1 either. Nor is
+            # there intra-layer slack to exploit: every A-side op sits either
+            # before the dispatch or after the combine.
+            return t_a + t_a2f + t_f + t_f2a, False
         if cfg.pipeline_model == "optimistic":
             # Need ≥ 2 + t_c / max(t_a, t_f) in-flight microbatches to
             # hide the network stage behind compute.  Equivalent to the
@@ -1382,12 +1545,15 @@ class AFDInferenceSession:
             # symmetric Phase-1 assumption (t_a2f == t_f2a).
             min_m = 2.0 + t_c / max(t_a, t_f, 1e-9)
             if num_microbatches < min_m:
-                logger.warning(
-                    "AFD optimistic pipeline: num_microbatches (%d) < min required (%.1f) "
-                    "to hide communication. Falling back to conservative model.",
-                    num_microbatches,
-                    min_m,
-                )
+                if not self._warned_optimistic_fallback:
+                    self._warned_optimistic_fallback = True
+                    logger.warning(
+                        "AFD optimistic pipeline: num_microbatches (%d) < min required (%.1f) "
+                        "to hide communication. Falling back to conservative model. "
+                        "Further occurrences in this session are suppressed.",
+                        num_microbatches,
+                        min_m,
+                    )
                 return max(t_a + t_a2f, t_f + t_f2a), False
             t_cycle = max(t_a, t_f, t_c)
             comm_hidden = t_c <= max(t_a, t_f)
@@ -1404,6 +1570,7 @@ class AFDInferenceSession:
         t_f2a: float,
         *,
         num_layers: int,
+        t_once: float = 0.0,
     ) -> tuple[float, float, bool]:
         """Return the Eq.5-style global decode-step latency.
 
@@ -1418,7 +1585,18 @@ class AFDInferenceSession:
         t_cycle, comm_hidden = self._pipeline_tcycle(t_a, t_f, t_a2f, t_f2a)
         pipeline_fill = t_a + t_f + t_a2f + t_f2a
         t_global_step = pipeline_fill + t_cycle * max(num_microbatches * num_layers - 1, 0)
-        return t_global_step, t_cycle, comm_hidden
+        # Once-per-step ops (embedding / logits GEMM) sit outside the pipelined
+        # layer loop: they run once before the first layer and once after the
+        # last, so they are added to the global step rather than folded into the
+        # per-layer cadence the pipeline maxes over.
+        #
+        # ``t_once`` arrives at MICRO-batch scale -- ``_afd_batch_shape`` sizes
+        # every latency query that way because the pipeline feeds micro-batches
+        # through one at a time. A global step therefore carries
+        # ``num_microbatches`` of them and pays embedding / logits once per
+        # micro-batch, not once in total. Scaling here rather than re-querying at
+        # full-batch size keeps the per-call shape the engine actually sees.
+        return t_global_step + t_once * num_microbatches, t_cycle, comm_hidden
 
     def _estimate_a_memory_dict(
         self,
@@ -1543,7 +1721,8 @@ class AFDInferenceSession:
         brk_t_f_per_layer: float,
         t_a2f_layer: float,
         t_f2a_layer: float,
-    ) -> tuple[float, float, float, float, dict, dict, bool]:
+        f_scale: float = 1.0,
+    ) -> tuple[float, float, float, float, dict, dict, bool, float]:
         """Integrate compute latency along the decode KV-cache length.
 
         Attention is the only op whose latency reads ``s``; sampling at
@@ -1565,9 +1744,42 @@ class AFDInferenceSession:
         max is
         evaluated on the full per-layer time, not on the compute-only
         time.
+
+        ``f_scale`` is ``AFDConfig.f_latency_scale``: it multiplies the
+        F-side compute so a fused FFN runtime can be emulated. The caller
+        has already scaled ``brk_t_f_per_layer``.
         """
         stride = self._AFD_DECODE_STRIDE
         verify_width = self._nextn + 1
+
+        # Embedding / logits GEMM run once per step, not once per layer, and
+        # read no ``s`` -- evaluate them once outside the stride loop and keep
+        # them out of the per-layer average the pipeline maxes over. An empty
+        # once-list is safe: ``_sum_latency`` returns ``(0.0, {})``.
+        a_layer_ops, a_once_ops = _split_once_per_step(a_partition.attn_ops, num_layers)
+        f_layer_ops, f_once_ops = _split_once_per_step(f_partition.ffn_ops, num_layers)
+        t_a_once, a_once_per_op = self._sum_once_per_step(
+            a_once_ops,
+            batch_size=a_batch_size * verify_width,
+            seq_len=isl + 1,
+            model=a_model,
+            runtime_config=runtime_config,
+            is_context=False,
+            database=self._a_database,
+        )
+        t_f_once, f_once_per_op = self._sum_once_per_step(
+            f_once_ops,
+            batch_size=b_batch_size * verify_width,
+            seq_len=isl + 1,
+            model=f_model,
+            runtime_config=runtime_config,
+            is_context=False,
+            database=self._f_database,
+        )
+        if f_scale != 1.0:
+            t_f_once *= f_scale
+            f_once_per_op = {k: v * f_scale for k, v in f_once_per_op.items()}
+        t_once = t_a_once + t_f_once
 
         t_a_layer_sum = 0.0
         t_f_layer_sum = 0.0
@@ -1589,7 +1801,7 @@ class AFDInferenceSession:
                 break
 
             t_a_step_i, a_per_op_i = self._sum_latency(
-                a_partition.attn_ops,
+                a_layer_ops,
                 batch_size=a_batch_size * verify_width,
                 seq_len=s_i,
                 model=a_model,
@@ -1598,7 +1810,7 @@ class AFDInferenceSession:
                 database=self._a_database,
             )
             t_f_step_i, f_per_op_i = self._sum_latency(
-                f_partition.ffn_ops,
+                f_layer_ops,
                 batch_size=b_batch_size * verify_width,
                 seq_len=s_i,
                 model=f_model,
@@ -1606,6 +1818,9 @@ class AFDInferenceSession:
                 is_context=False,
                 database=self._f_database,
             )
+            if f_scale != 1.0:
+                t_f_step_i *= f_scale
+                f_per_op_i = {k: v * f_scale for k, v in f_per_op_i.items()}
 
             t_a_layer_i = t_a_step_i / num_layers + brk_t_a_per_layer
             t_f_layer_i = t_f_step_i / num_layers + brk_t_f_per_layer
@@ -1619,6 +1834,7 @@ class AFDInferenceSession:
                 t_a2f_layer,
                 t_f2a_layer,
                 num_layers=num_layers,
+                t_once=t_once,
             )
             comm_hidden = comm_hidden_i
 
@@ -1639,6 +1855,12 @@ class AFDInferenceSession:
         t_step_avg = t_step_sum / denom
         a_per_op = {k: v / denom for k, v in a_per_op_sum.items()}
         f_per_op = {k: v / denom for k, v in f_per_op_sum.items()}
+        # Once-per-step costs are already whole-step values, so they are added
+        # after the stride averaging rather than being weighted by ``repeat``.
+        for k, v in a_once_per_op.items():
+            a_per_op[k] = a_per_op.get(k, 0.0) + v
+        for k, v in f_once_per_op.items():
+            f_per_op[k] = f_per_op.get(k, 0.0) + v
         return (
             t_a_layer_avg,
             t_f_layer_avg,
@@ -1647,6 +1869,7 @@ class AFDInferenceSession:
             a_per_op,
             f_per_op,
             comm_hidden,
+            t_once,
         )
 
     def _simulate_phase(
@@ -1695,9 +1918,28 @@ class AFDInferenceSession:
             )
         # Boundary ops (``add_norm_2`` / ``logits_gemm``) default to the
         # A-Worker, but ``cfg.boundary_on_attn`` lets the user reassign
-        # them to the F-Worker for sensitivity studies.
-        a_partition = build_afd_ops_partition(a_model, phase=ops_phase, boundary_on_attn=cfg.boundary_on_attn)
-        f_partition = build_afd_ops_partition(f_model, phase=ops_phase, boundary_on_attn=cfg.boundary_on_attn)
+        # them to the F-Worker for sensitivity studies. ``cfg.router_on_attn``
+        # does the same for the MoE router (FastAFD routes on the A side).
+        a_partition = build_afd_ops_partition(
+            a_model,
+            phase=ops_phase,
+            boundary_on_attn=cfg.boundary_on_attn,
+            router_on_attn=cfg.router_on_attn,
+        )
+        f_partition = build_afd_ops_partition(
+            f_model,
+            phase=ops_phase,
+            boundary_on_attn=cfg.boundary_on_attn,
+            router_on_attn=cfg.router_on_attn,
+        )
+        # The model-internal MoE dispatch all-to-all IS the cross-pool A<->F
+        # transfer under AFD; it does not run in addition to it. The
+        # partitioner's "dispatch" skip marker only steers the OverlapOp
+        # classification vote, so a nested dispatch stays folded into t_f and
+        # the same bytes get billed twice. Strip it here, unconditionally --
+        # only ``f_partition.ffn_ops`` feeds F-pool compute, and a MoE
+        # OverlapOp always classifies to the F side.
+        f_partition = _strip_moe_dispatch_from_partition(f_partition)
 
         isl = runtime_config.isl
         osl = runtime_config.osl or 1
@@ -1709,7 +1951,7 @@ class AFDInferenceSession:
             a_micro_batch_size,
             _b_total,
             b_micro_total,
-            _num_microbatches,
+            num_microbatches,
         ) = self._afd_batch_shape()
 
         # AFD comm (A↔F cross-pool transfers, F-node AllGather /
@@ -1766,7 +2008,15 @@ class AFDInferenceSession:
         t_f2a_layer = float(r_f2a)
         t_c_layer = t_a2f_layer + t_f2a_layer
         brk_t_a_per_layer = float(r_cmb)
-        brk_t_f_per_layer = float(r_ag) + float(r_rs)
+        # ``f_latency_scale`` calibrates the whole F side against a specific
+        # FFN runtime (e.g. a fused MegaMoE-style kernel versus stock per-op
+        # data). It covers F compute plus the F-node intra-node AG/RS, which
+        # the fused kernel also absorbs. The cross-pool transfers and the
+        # A-side combine are fabric/A-side costs and stay unscaled.
+        f_scale = float(cfg.f_latency_scale or 1.0)
+        brk_t_f_per_layer = (float(r_ag) + float(r_rs)) * f_scale
+        if f_scale != 1.0:
+            brk["t_f"] = {label: ms * f_scale for label, ms in brk["t_f"].items()}
 
         # Ops in :mod:`aiconfigurator.sdk.models` are constructed with
         # ``scale_factor=num_layers`` (per-layer ops such as qkv_gemm) or
@@ -1788,6 +2038,7 @@ class AFDInferenceSession:
                 a_per_op,
                 f_per_op,
                 comm_hidden,
+                t_once,
             ) = self._integrate_decode_phase(
                 a_partition=a_partition,
                 f_partition=f_partition,
@@ -1803,6 +2054,7 @@ class AFDInferenceSession:
                 brk_t_f_per_layer=brk_t_f_per_layer,
                 t_a2f_layer=t_a2f_layer,
                 t_f2a_layer=t_f2a_layer,
+                f_scale=f_scale,
             )
             # ``comm_hidden`` was captured during the decode integration
             # loop above — reuse it instead of re-evaluating
@@ -1812,8 +2064,13 @@ class AFDInferenceSession:
             # Prefill: single shot over the uncached input suffix; no
             # need to integrate, ``s == isl - prefix`` everywhere.
             seq_len_query = effective_prefill_len
+            # Embedding / logits GEMM run once per step, not once per layer:
+            # amortizing them across layers would inflate the per-layer basis
+            # the pipeline maxes over.
+            a_layer_ops, a_once_ops = _split_once_per_step(a_partition.attn_ops, num_layers)
+            f_layer_ops, f_once_ops = _split_once_per_step(f_partition.ffn_ops, num_layers)
             t_a_total, a_per_op = self._sum_latency(
-                a_partition.attn_ops,
+                a_layer_ops,
                 batch_size=a_micro_batch_size,
                 seq_len=seq_len_query,
                 model=a_model,
@@ -1822,7 +2079,7 @@ class AFDInferenceSession:
                 database=self._a_database,
             )
             t_f_total, f_per_op = self._sum_latency(
-                f_partition.ffn_ops,
+                f_layer_ops,
                 batch_size=b_micro_total,
                 seq_len=seq_len_query,
                 model=f_model,
@@ -1830,10 +2087,41 @@ class AFDInferenceSession:
                 is_context=True,
                 database=self._f_database,
             )
+            t_a_once, a_once_per_op = self._sum_once_per_step(
+                a_once_ops,
+                batch_size=a_micro_batch_size,
+                seq_len=seq_len_query,
+                model=a_model,
+                runtime_config=runtime_config,
+                is_context=True,
+                database=self._a_database,
+            )
+            t_f_once, f_once_per_op = self._sum_once_per_step(
+                f_once_ops,
+                batch_size=b_micro_total,
+                seq_len=seq_len_query,
+                model=f_model,
+                runtime_config=runtime_config,
+                is_context=True,
+                database=self._f_database,
+            )
+            if f_scale != 1.0:
+                t_f_total *= f_scale
+                t_f_once *= f_scale
+                f_per_op = {k: v * f_scale for k, v in f_per_op.items()}
+                f_once_per_op = {k: v * f_scale for k, v in f_once_per_op.items()}
+            for k, v in a_once_per_op.items():
+                a_per_op[k] = a_per_op.get(k, 0.0) + v
+            for k, v in f_once_per_op.items():
+                f_per_op[k] = f_per_op.get(k, 0.0) + v
+            t_once = t_a_once + t_f_once
             t_a_layer = t_a_total / num_layers + brk_t_a_per_layer
             t_f_layer = t_f_total / num_layers + brk_t_f_per_layer
             t_cycle, comm_hidden = self._pipeline_tcycle(t_a_layer, t_f_layer, t_a2f_layer, t_f2a_layer)
-            t_step = num_layers * t_cycle
+            # ``t_once`` is a per-micro-batch cost (see
+            # ``_pipeline_global_step_latency``), so a step carrying
+            # ``num_microbatches`` of them pays it that many times.
+            t_step = num_layers * t_cycle + t_once * num_microbatches
 
         # Per-op dicts are tracked in *per-step* units (matching
         # ``_sum_latency`` output), so amortize per-layer values up by
@@ -1877,8 +2165,14 @@ class AFDInferenceSession:
             "t_c_layer": t_c_layer,
             "t_cycle": t_cycle,
             "t_step": t_step,
+            # Embedding / logits GEMM: charged once per step, outside the
+            # pipelined layer loop. Surfaced so the split is observable
+            # rather than only visible as a shift in ``t_step``.
+            "t_once_per_step": t_once,
             "comm_hidden": comm_hidden,
             "balance_ratio": balance_ratio,
+            # Surfaced so a calibrated row is distinguishable from raw data.
+            "f_latency_scale": f_scale,
             "a_per_op": dict(a_per_op),
             "f_per_op": dict(f_per_op),
             "a_memory": a_memory,
@@ -2015,13 +2309,14 @@ class AFDInferenceSession:
         "t_f2a_layer",
         "t_c_layer",
         "t_step",
+        "t_once_per_step",
         "balance_ratio",
         "comm_hidden",
     )
 
     @classmethod
     def _phase_scalars(cls, metrics: dict | None) -> dict:
-        """Return the 8 per-phase layer scalars (rounded), or NaN/None when
+        """Return the 9 per-phase layer scalars (rounded), or NaN/None when
         the phase was not run.
 
         ``comm_hidden`` is the only boolean among them; surface it as
@@ -2089,6 +2384,7 @@ class AFDInferenceSession:
             headline = self._phase_scalars(None)
         t_a_layer = headline["t_a_layer"]
         t_f_layer = headline["t_f_layer"]
+        t_once_per_step = headline["t_once_per_step"]
         t_a2f_layer = headline["t_a2f_layer"]
         t_f2a_layer = headline["t_f2a_layer"]
         t_c_layer = headline["t_c_layer"]
@@ -2197,14 +2493,24 @@ class AFDInferenceSession:
             "t_f2a_layer": t_f2a_layer,
             "t_c_layer": t_c_layer,
             "t_step": t_step,
+            # Embedding / logits GEMM: charged once per step, outside the
+            # pipelined layer loop rather than amortized into the per-layer
+            # cadence. Surfaced so the split is observable in a result row
+            # rather than only as a shift in ``t_step``.
+            "t_once_per_step": t_once_per_step,
             "balance_ratio": balance_ratio,
             "comm_hidden": comm_hidden,
+            # Config-level, not per-phase: surfaced so a calibrated row is
+            # distinguishable from one built on raw kernel data.
+            "f_latency_scale": float(self._afd_config.f_latency_scale or 1.0),
+            "router_on_attn": bool(self._afd_config.router_on_attn),
             "prefill_t_a_layer": prefill_scalars["t_a_layer"],
             "prefill_t_f_layer": prefill_scalars["t_f_layer"],
             "prefill_t_a2f_layer": prefill_scalars["t_a2f_layer"],
             "prefill_t_f2a_layer": prefill_scalars["t_f2a_layer"],
             "prefill_t_c_layer": prefill_scalars["t_c_layer"],
             "prefill_t_step": prefill_scalars["t_step"],
+            "prefill_t_once_per_step": prefill_scalars["t_once_per_step"],
             "prefill_balance_ratio": prefill_scalars["balance_ratio"],
             "prefill_comm_hidden": prefill_scalars["comm_hidden"],
             "decode_t_a_layer": decode_scalars["t_a_layer"],
@@ -2213,6 +2519,7 @@ class AFDInferenceSession:
             "decode_t_f2a_layer": decode_scalars["t_f2a_layer"],
             "decode_t_c_layer": decode_scalars["t_c_layer"],
             "decode_t_step": decode_scalars["t_step"],
+            "decode_t_once_per_step": decode_scalars["t_once_per_step"],
             "decode_balance_ratio": decode_scalars["balance_ratio"],
             "decode_comm_hidden": decode_scalars["comm_hidden"],
             "ttft": round(ttft, 3),

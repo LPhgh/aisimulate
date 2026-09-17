@@ -329,6 +329,21 @@ class AFDConfig:
     num_microbatches: int = 3
     pipeline_model: str = "optimistic"  # "optimistic" (K=3), "conservative" (K=2), or "serial"
     comm_overhead_factor: float = 1.0
+    # Router placement. False (default) keeps aic's partition: un-routed
+    # hidden states cross the pool boundary and the F-worker runs
+    # router + grouping + experts. True matches the FastAFD boundary:
+    # routing happens on the A-worker and routed tokens cross. The transfer
+    # *volume* model is identical either way; only the router GEMM's pool
+    # attribution changes.
+    router_on_attn: bool = False
+    # F-pool latency calibration factor. Multiplies every F-side
+    # contribution (MoE compute, router, intra-node AG/RS) so the predicted
+    # T_e can be calibrated against a specific FFN runtime -- e.g. 0.3-0.5
+    # emulates FastAFD's fused MegaMoE kernel (measured 42-44% lower decode
+    # step latency) versus stock per-op kernel data. 1.0 = no calibration.
+    # This is a calibration knob, not a physical model: the number has to
+    # come from outside measurement.
+    f_latency_scale: float = 1.0
     # Which phase(s) AFD should be applied to.
     # "decode" (default) mirrors existing behavior; "prefill" applies to
     # the context phase; "both" produces an aggregated estimate combining
@@ -389,6 +404,8 @@ class AFDConfig:
             raise ValueError(f"num_microbatches ({self.num_microbatches}) must be >= 1.")
         if self.comm_overhead_factor <= 0:
             raise ValueError(f"comm_overhead_factor ({self.comm_overhead_factor}) must be > 0.")
+        if self.f_latency_scale <= 0:
+            raise ValueError(f"f_latency_scale ({self.f_latency_scale}) must be > 0.")
         if self.f_moe_ep_size < 1:
             raise ValueError(f"f_moe_ep_size ({self.f_moe_ep_size}) must be >= 1.")
         if self.gpus_per_node < 1:
@@ -441,3 +458,18 @@ class AFDConfig:
     def effective_f_gpus_per_node(self) -> int:
         """F-pool GPUs per node; ``f_gpus_per_node`` or ``gpus_per_node``."""
         return self.f_gpus_per_node if self.f_gpus_per_node else self.gpus_per_node
+
+    @property
+    def f_moe_tp_size(self) -> int:
+        """F-side MoE tensor-parallel width: ``tp_f / f_moe_ep_size``.
+
+        ``1`` means pure expert parallelism -- every F rank owns its own
+        experts, so no token-dimension TP group exists and the F-node
+        AllGather/ReduceScatter pair has nothing to exchange. Consumers use
+        this as an *existence* gate; it never affects collective sizing.
+
+        Derived rather than configured: under the Phase 1 F-DP=1 assumption
+        ``tp_f == n_f_workers``, which already follows the F pool's own node
+        width under hetero A/F.
+        """
+        return max(self.n_f_workers // max(int(self.f_moe_ep_size), 1), 1)
