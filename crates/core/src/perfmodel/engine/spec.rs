@@ -376,6 +376,7 @@ mod tests {
             pp_size: 4,
             hidden_size: 4096,
             seq_split: 1,
+            span_gpus: None,
         }
     }
 
