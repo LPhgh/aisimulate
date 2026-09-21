@@ -1013,6 +1013,7 @@ def afd_pareto(
     # behavior exactly. The A pool is the top-level system by definition.
     # Every pool shares the single top-level ``backend_name``.
     f_database: PerfDatabase | None = None,
+    f_model_config: config.ModelConfig | None = None,
     f_system_name: str | None = None,
     f_gpus_per_node: int | None = None,
     prefill_database: PerfDatabase | None = None,
@@ -1056,7 +1057,11 @@ def afd_pareto(
     the static prefill pool; the A pool is always the top-level system.
     Each unset argument inherits the shared value. Cross-pool A2F/F2A
     traffic is priced at the slower of the two endpoints (see
-    :class:`AFDTransfer`).
+    :class:`AFDTransfer`). ``f_model_config`` is the F pool's own template:
+    quant modes are system-dependent (the nvfp4 hardware ladder, arch-specific
+    MoE kernels), so a pool on different hardware cannot inherit the
+    A-system-resolved modes in ``model_config``. Unset (homogeneous F pool)
+    falls back to ``model_config``.
 
     OOM candidates and per-candidate failures are skipped. Returns a
     DataFrame with :data:`common.ColumnsAFD` columns sorted by
@@ -1091,9 +1096,15 @@ def afd_pareto(
     effective_f_system_name = f_system_name or str(getattr(effective_f_database, "system", ""))
     quant_modes = dict(quant_modes or {})
     base_model_config = copy.deepcopy(model_config) if model_config is not None else config.ModelConfig()
+    # A hetero F pool prices its GEMM/MoE kernels on its own hardware, so the
+    # caller hands a template whose system-dependent quant modes were resolved
+    # against the F system (the A-resolved modes in ``base_model_config`` would
+    # mis-model it). Homogeneous pools share the single template.
+    f_base_model_config = copy.deepcopy(f_model_config) if f_model_config is not None else base_model_config
     for key, value in quant_modes.items():
         if value is not None:
             setattr(base_model_config, key, value)
+            setattr(f_base_model_config, key, value)
 
     prefill_options: list[dict] = []
     if combined_with_pd:
@@ -1205,7 +1216,7 @@ def afd_pareto(
                 a_model_config.moe_ep_size = 1
                 a_model_config.attention_dp_size = 1
 
-                f_model_config = copy.deepcopy(base_model_config)
+                f_model_config = copy.deepcopy(f_base_model_config)
                 f_model_config.tp_size = tp_f
                 f_model_config.pp_size = 1
                 f_model_config.moe_tp_size = f_moe_tp

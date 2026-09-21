@@ -24,7 +24,8 @@ from typing import ClassVar
 
 import pytest
 
-from aiconfigurator.sdk.config import AFDConfig
+from aiconfigurator.sdk import common
+from aiconfigurator.sdk.config import AFDConfig, ModelConfig
 from aiconfigurator.sdk.inference_session import AFDInferenceSession
 from aiconfigurator.sdk.operations import AFDFAllGather, AFDFReduceScatter, AFDTransfer
 from aiconfigurator.sdk.performance_result import PerformanceResult
@@ -839,6 +840,7 @@ class TestAfdParetoHeteroWiring:
 class TestSweepAfdPassthrough:
     _POOL_ARGS = (
         "f_database",
+        "f_model_config",
         "f_system_name",
         "f_gpus_per_node",
         "prefill_gpus_per_node",
@@ -909,3 +911,127 @@ class TestSweepAfdPassthrough:
 
         for name in self._POOL_ARGS:
             assert seen[name] is None, f"{name!r} should default to None, got {seen[name]!r}"
+
+
+# ---------------------------------------------------------------------------
+# 8. Per-pool quant resolution: a hetero F pool prices GEMM/MoE on its own
+#    hardware instead of inheriting the A system's resolution
+# ---------------------------------------------------------------------------
+
+# Bundled NVFP4 checkpoint: its gemm/moe inference is nvfp4, so the hardware
+# ladder (native nvfp4 on Blackwell, nvfp4_wo elsewhere) differs per system and
+# the pool-level resolution becomes observable.
+_NVFP4_MODEL = "nvidia/DeepSeek-V3.1-NVFP4"
+
+
+def _nvfp4_afd_task(**overrides) -> Task:
+    return _afd_task(model_path=_NVFP4_MODEL, **overrides)
+
+
+class TestPoolQuantReResolution:
+    def test_checkpoint_infers_native_nvfp4(self):
+        """Anchor for the expectations below: the modes a Blackwell pool must
+        end up with are the checkpoint's native nvfp4, which get_model infers
+        while the template deliberately leaves them unset."""
+        from aiconfigurator.sdk.models import _get_model_info, _infer_quant_modes_from_raw_config
+
+        inferred = _infer_quant_modes_from_raw_config(_get_model_info(_NVFP4_MODEL)["raw_config"])
+        assert inferred["gemm_quant_mode"] == common.GEMMQuantMode.nvfp4
+        assert inferred["moe_quant_mode"] == common.MoEQuantMode.nvfp4
+
+    def test_shared_template_carries_the_a_system_ladder(self):
+        """The agg-role resolution keys on the top-level (A) system: Hopper has
+        no native FP4 tensor cores, so nvfp4 downgrades to nvfp4_wo there. This
+        is the value the F pool used to inherit unchanged."""
+        task = _nvfp4_afd_task(afd_f_system_name="b200_sxm")
+        agg_cfg = task.build_model_config(role="agg")
+        assert agg_cfg.gemm_quant_mode == common.GEMMQuantMode.nvfp4_wo
+        assert agg_cfg.moe_quant_mode == common.MoEQuantMode.nvfp4_wo
+
+    def test_blackwell_f_pool_does_not_inherit_the_hopper_downgrade(self):
+        """Regression (headline h200_sxm A + b200_sxm F pairing): the F template
+        must not carry the A system's nvfp4_wo. Unset modes let get_model
+        resolve the checkpoint's native nvfp4 on Blackwell -- the same state the
+        single-point estimate path hands to get_model for its f_model_config, so
+        sweep and estimate now agree."""
+        task = _nvfp4_afd_task(afd_f_system_name="b200_sxm")
+        f_cfg = task._build_afd_f_model_config()
+        assert f_cfg is not None
+        assert f_cfg.gemm_quant_mode is None
+        assert f_cfg.moe_quant_mode is None
+
+    def test_hopper_f_pool_gets_the_downgrade_the_a_pool_skipped(self):
+        """Reverse direction: b200_sxm A keeps native nvfp4, so an h200_sxm F
+        pool must be downgraded to nvfp4_wo for its own hardware instead of
+        inheriting a mode Hopper has no data lane for."""
+        task = _nvfp4_afd_task(system_name="b200_sxm", afd_f_system_name="h200_sxm")
+        assert task.build_model_config(role="agg").gemm_quant_mode == common.GEMMQuantMode.nvfp4
+        f_cfg = task._build_afd_f_model_config()
+        assert f_cfg.gemm_quant_mode == common.GEMMQuantMode.nvfp4_wo
+        assert f_cfg.moe_quant_mode == common.MoEQuantMode.nvfp4_wo
+
+    def test_homogeneous_f_pool_returns_no_template(self):
+        """No override -> None, so the sweep reuses the shared template and the
+        homogeneous path stays byte-for-byte identical."""
+        assert _nvfp4_afd_task()._build_afd_f_model_config() is None
+
+    def test_explicit_mode_is_the_users_contract(self):
+        """A pinned mode survives the re-resolution untouched, per mode: only
+        the unpinned one is re-derived against the pool's system."""
+        task = _nvfp4_afd_task(afd_f_system_name="b200_sxm", moe_quant_mode=common.MoEQuantMode.fp8)
+        f_cfg = task._build_afd_f_model_config()
+        assert f_cfg.moe_quant_mode == common.MoEQuantMode.fp8
+        assert f_cfg.gemm_quant_mode is None
+
+    def test_sweep_kwargs_forward_the_f_template(self):
+        """End-to-end wiring: sweep_afd_kwargs hands the re-resolved template to
+        the sweep for a hetero pool, and None for a homogeneous one."""
+        hetero = _nvfp4_afd_task(afd_combined_with_pd=False, afd_f_system_name="b200_sxm")
+        shared = hetero._load_database(hetero.system_name, hetero.backend_name, hetero.backend_version)
+        kwargs = hetero.sweep_afd_kwargs(database=shared)
+        assert kwargs["f_model_config"] is not None
+        assert kwargs["f_model_config"].gemm_quant_mode is None
+        assert kwargs["model_config"].gemm_quant_mode == common.GEMMQuantMode.nvfp4_wo
+
+        homo = _nvfp4_afd_task(afd_combined_with_pd=False)
+        assert homo.sweep_afd_kwargs(database=shared)["f_model_config"] is None
+
+
+class TestAfdParetoQuantWiring:
+    def test_f_template_prices_f_candidates(self, monkeypatch):
+        """afd_pareto deep-copies the F template (not the shared A one) for each
+        candidate, overwriting parallelism only."""
+        captured, pa = _patch_pareto(monkeypatch)
+        a_tpl = ModelConfig(
+            gemm_quant_mode=common.GEMMQuantMode.nvfp4_wo,
+            moe_quant_mode=common.MoEQuantMode.nvfp4_wo,
+        )
+        f_tpl = ModelConfig(
+            gemm_quant_mode=common.GEMMQuantMode.nvfp4,
+            moe_quant_mode=common.MoEQuantMode.nvfp4,
+        )
+        pa.afd_pareto(
+            **_pareto_kwargs(
+                model_config=a_tpl,
+                f_model_config=f_tpl,
+                f_database=_PoolDatabase("b200_sxm"),
+                f_system_name="b200_sxm",
+            )
+        )
+        session_kwargs = captured["session_kwargs"][0]
+        assert session_kwargs["f_model_config"].gemm_quant_mode == common.GEMMQuantMode.nvfp4
+        assert session_kwargs["f_model_config"].moe_quant_mode == common.MoEQuantMode.nvfp4
+        assert session_kwargs["a_model_config"].gemm_quant_mode == common.GEMMQuantMode.nvfp4_wo
+        # Parallelism still comes from the candidate, not from the template.
+        assert session_kwargs["f_model_config"].tp_size == 1 * 8
+        assert session_kwargs["f_model_config"].moe_ep_size == 1
+
+    def test_missing_f_template_reuses_the_shared_one(self, monkeypatch):
+        """Homogeneous guard: without the kwarg the F candidate keeps the shared
+        template's modes (deep-copied, so candidates never alias it)."""
+        captured, pa = _patch_pareto(monkeypatch)
+        shared_tpl = ModelConfig(gemm_quant_mode=common.GEMMQuantMode.nvfp4_wo)
+        pa.afd_pareto(**_pareto_kwargs(model_config=shared_tpl))
+        f_cfg = captured["session_kwargs"][0]["f_model_config"]
+        assert f_cfg.gemm_quant_mode == common.GEMMQuantMode.nvfp4_wo
+        assert f_cfg is not shared_tpl

@@ -47,8 +47,10 @@ from aiconfigurator.sdk.models import (
     attention_op_keys,
     check_is_moe,
     get_model_family,
+    resolve_dsv4_moe_arch,
     resolve_dsv4_moe_arch_mode,
     resolve_kimi_k3_moe_arch_mode,
+    resolve_nvfp4_for_system,
     resolve_vllm_moe_execution_mode,
 )
 from aiconfigurator.sdk.models.blocks.moe import LARGE_EP_READY_FAMILIES, MoEBlockShape
@@ -1204,6 +1206,12 @@ class Task:
         # checkpoint-specific mixed-precision splits.
         self._gemm_quant_mode_explicit_by_role = {
             role: self._role_attr(role, "gemm_quant_mode") is not None for role in roles
+        }
+        # Same provenance for MoE: the AFD F pool re-resolves the
+        # system-dependent modes against its own hardware (see
+        # _build_afd_f_model_config) and must leave user-explicit values alone.
+        self._moe_quant_mode_explicit_by_role = {
+            role: self._role_attr(role, "moe_quant_mode") is not None for role in roles
         }
         if self.serving_mode == "afd" and self.afd_combined_with_pd:
             # AFD's internal static-prefill view inherits the agg quant mode
@@ -3006,6 +3014,57 @@ class Task:
             )
         return database
 
+    def _build_afd_f_model_config(self) -> config.ModelConfig | None:
+        """F-pool ModelConfig template with quant re-resolved for its hardware.
+
+        AFD resolves quant once for the aggregate view (``roles == ["agg"]`` in
+        :meth:`_resolve_quant_modes`), so those modes are keyed to the
+        top-level -- i.e. the A pool's -- system. An F pool on different
+        hardware must price its GEMM/MoE kernels against ITS system, exactly as
+        the single-point estimate path does (``cli/api.py`` resolves
+        ``f_model_config`` against ``f_system``); inheriting the A-resolved
+        modes would model a Blackwell F pool with the Hopper ``nvfp4_wo``
+        downgrade (and a Hopper F pool with native ``nvfp4``).
+
+        Returns ``None`` when the F pool keeps the top-level system, so the
+        sweep reuses the shared template and the homogeneous path stays
+        byte-for-byte identical.
+        """
+        f_system = self.afd_pool_attr("afd_f", "system_name")
+        if f_system == self.system_name:
+            return None
+        cfg = self.build_model_config(role="agg")
+        # Re-derive only the system-dependent modes, and only when the user did
+        # not pin them: an explicit value is the user's contract (validate stays
+        # fail-fast on it). FMHA/KV-cache are not part of the nvfp4 hardware
+        # ladder, and the F pool never runs FMHA at all.
+        if not self._moe_quant_mode_explicit_by_role.get("agg", False):
+            cfg.moe_quant_mode = None
+            # GPT-OSS Blackwell promotion re-evaluated against the F pool's
+            # system (mirrors _resolve_quant_modes, which keys it per role).
+            if (
+                self.backend_name == "trtllm"
+                and self.model_path in _GPTOSS_BLACKWELL_MODELS
+                and is_blackwell_system(f_system)
+            ):
+                cfg.moe_quant_mode = common.MoEQuantMode.w4a8_mxfp4_mxfp8
+            resolve_dsv4_moe_arch(
+                cfg,
+                self.model_path,
+                system_name=f_system,
+                backend_name=self.backend_name,
+                moe_backend=self.moe_backend,
+            )
+        if not self._gemm_quant_mode_explicit_by_role.get("agg", False):
+            cfg.gemm_quant_mode = None
+        # Non-Blackwell F pool: re-apply the nvfp4 -> nvfp4_wo ladder (the
+        # helper infers from the checkpoint while the modes are unset).
+        # Blackwell F pool: no-op, so unset modes stay unset and get_model's
+        # checkpoint inference resolves native nvfp4 -- the same state the
+        # estimate path hands to get_model.
+        resolve_nvfp4_for_system(cfg, f_system, self.model_path, backend_name=self.backend_name)
+        return cfg
+
     def sweep_afd_kwargs(self, *, database) -> dict[str, Any]:
         """Return the exact kwargs needed for sweep.sweep_afd.
 
@@ -3035,6 +3094,9 @@ class Task:
         p_system = self.afd_pool_attr("afd_prefill", "system_name")
         f_database = self._afd_pool_database("afd_f", shared_database=database)
         prefill_database = self._afd_pool_database("afd_prefill", shared_database=database)
+        # A hetero F pool also needs its own quant resolution: the shared
+        # template below carries the modes resolved for the A pool's system.
+        f_model_config = self._build_afd_f_model_config()
 
         return {
             "model_path": self.model_path,
@@ -3054,8 +3116,10 @@ class Task:
             "free_gpu_memory_fraction": self.free_gpu_memory_fraction,
             "max_seq_len": self.max_seq_len,
             # F pool (hetero-capable; inherits the top level when unset --
-            # then f_database is the very same object as ``database``)
+            # then f_database is the very same object as ``database`` and
+            # f_model_config is None, so the shared template is reused)
             "f_database": f_database,
+            "f_model_config": f_model_config,
             "f_system_name": f_system,
             "f_gpus_per_node": self._afd_f_gpus_per_node,
             # combined-with-PD prefill options

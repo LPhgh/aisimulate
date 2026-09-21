@@ -1626,6 +1626,7 @@ def sweep_afd(
     # top-level system by definition. Every pool shares the single top-level
     # backend_name.
     f_database: PerfDatabase | None = None,
+    f_model_config: config.ModelConfig | None = None,
     f_system_name: str | None = None,
     f_gpus_per_node: int | None = None,
     # combined-with-PD prefill options
@@ -1685,6 +1686,7 @@ def sweep_afd(
         free_gpu_memory_fraction=free_gpu_memory_fraction,
         max_seq_len=max_seq_len,
         f_database=f_database,
+        f_model_config=f_model_config,
         f_system_name=f_system_name,
         f_gpus_per_node=f_gpus_per_node,
         prefill_database=prefill_database,
