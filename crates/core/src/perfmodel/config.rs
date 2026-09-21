@@ -83,7 +83,9 @@ pub const ENGINE_CONFIG_SCHEMA_VERSION: u32 = 1;
 // - 19 (AFD super-node fabric tiering): `P2POp` gained `span_gpus` — a
 //   positional bincode op-layout change (the serde default covers JSON
 //   only, same class as v12/v14).
-pub const ENGINE_SPEC_SCHEMA_VERSION: u32 = 19;
+// - 20 (AFD cross-system fabric fix): `P2POp` gained `force_scale_out`
+//   — a positional bincode op-layout change (same class as v12/v14/v19).
+pub const ENGINE_SPEC_SCHEMA_VERSION: u32 = 20;
 
 /// Static engine identity and setup information carried by an
 /// [`crate::perfmodel::engine::spec::EngineSpec`].

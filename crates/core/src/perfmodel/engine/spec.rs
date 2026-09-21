@@ -377,6 +377,7 @@ mod tests {
             hidden_size: 4096,
             seq_split: 1,
             span_gpus: None,
+            force_scale_out: false,
         }
     }
 
@@ -1108,8 +1109,9 @@ mod tests {
         let mut bytes = spec.to_bincode().expect("to_bincode");
 
         // Recreate the pre-field wire layout. A standalone bincode op encodes
-        // exactly as it does inside the vec, and `span_gpus: None` is the
-        // final byte of the P2P encoding (a single 0 tag). Removing it
+        // exactly as it does inside the vec, and the P2P encoding ends with
+        // the two bytes a v18 producer never emitted: the `span_gpus: None`
+        // tag (v19) and `force_scale_out: false` (v20). Removing them
         // yields the byte stream a v18 producer would have emitted — op
         // decoding would then misread the following Nccl op's variant index
         // as the Option tag.
@@ -1118,9 +1120,11 @@ mod tests {
             .windows(p2p_bytes.len())
             .position(|window| window == p2p_bytes.as_slice())
             .expect("P2P op encoding appears in the wire payload");
-        let tag_index = p2p_start + p2p_bytes.len() - 1;
-        assert_eq!(bytes[tag_index], 0, "None span_gpus is one 0 tag byte");
-        bytes.remove(tag_index);
+        let tail = p2p_start + p2p_bytes.len();
+        assert_eq!(bytes[tail - 2], 0, "None span_gpus is one 0 tag byte");
+        assert_eq!(bytes[tail - 1], 0, "force_scale_out=false is one 0 byte");
+        bytes.remove(tail - 1);
+        bytes.remove(tail - 2);
         bytes[..4].copy_from_slice(&18u32.to_le_bytes());
 
         match EngineSpec::from_bincode(&bytes) {
@@ -1135,6 +1139,49 @@ mod tests {
             }
             other => {
                 panic!("expected UnsupportedSchemaVersion for a v18 P2P payload, got {other:?}")
+            }
+        }
+    }
+
+    /// v19 -> v20 regression (AFD cross-system fabric fix): `P2POp` gained
+    /// `force_scale_out: bool`, a positional bincode layout change. A
+    /// v19 producer's P2P payload ends at the `span_gpus` tag; the missing
+    /// bool would otherwise be consumed from the following op's variant
+    /// index, so the version gate must reject it as
+    /// `UnsupportedSchemaVersion` before op decoding.
+    #[test]
+    fn from_bincode_rejects_v19_p2p_producer_at_the_version_gate() {
+        let spec = EngineSpec::new(
+            sample_engine_config(),
+            vec![OpSpec::P2P(p2p()), OpSpec::Nccl(nccl())],
+            vec![],
+        );
+        let mut bytes = spec.to_bincode().expect("to_bincode");
+
+        // Same trick as the v18 case, removing only the final byte — the
+        // `force_scale_out: false` a v19 producer never emitted.
+        let p2p_bytes = bincode::serialize(&OpSpec::P2P(p2p())).expect("op bytes");
+        let p2p_start = bytes
+            .windows(p2p_bytes.len())
+            .position(|window| window == p2p_bytes.as_slice())
+            .expect("P2P op encoding appears in the wire payload");
+        let tag_index = p2p_start + p2p_bytes.len() - 1;
+        assert_eq!(bytes[tag_index], 0, "force_scale_out=false is one 0 byte");
+        bytes.remove(tag_index);
+        bytes[..4].copy_from_slice(&19u32.to_le_bytes());
+
+        match EngineSpec::from_bincode(&bytes) {
+            Err(AicError::UnsupportedSchemaVersion {
+                kind,
+                got,
+                expected,
+            }) => {
+                assert_eq!(kind, "EngineSpec");
+                assert_eq!(got, 19);
+                assert_eq!(expected, ENGINE_SPEC_SCHEMA_VERSION);
+            }
+            other => {
+                panic!("expected UnsupportedSchemaVersion for a v19 P2P payload, got {other:?}")
             }
         }
     }

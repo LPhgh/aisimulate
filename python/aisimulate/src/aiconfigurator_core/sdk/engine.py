@@ -128,6 +128,10 @@ from aiconfigurator_core.sdk.rust_engine_step import (
 # - 18 (speculation migration): Generation attention gained verify_query_tokens
 #   and FPM forward gained verify_width, both positional bincode fields.
 #   TokenScale was appended to remap draft query widths before op lookup.
+# - 19 (AFD super-node fabric tiering): P2P gained span_gpus — a positional
+#   bincode op-layout change (the serde default covers JSON only).
+# - 20 (AFD cross-system fabric fix): P2P gained force_scale_out —
+#   cross-system pool pairs skip the rack-local tiers regardless of span.
 # Single owner: the Rust crate constant. Python re-exports it for
 # diagnostics/tests instead of declaring a twin to keep in sync.
 ENGINE_SPEC_SCHEMA_VERSION = aiconfigurator_core.engine_spec_schema_version()

@@ -209,23 +209,30 @@ class _SpanRecordingEngine:
 
     def __init__(self, factors: dict | None = None) -> None:
         self.spans: list[int | None] = []
+        self.force_scale_outs: list[bool] = []
         self.databases: list = []
         self._factors = factors or {}
 
     def __call__(self, database, op):
-        self.spans.append(op._span_gpus if hasattr(op, "_span_gpus") else _probe_span(op))
+        inner = _probe_spec(op)
+        self.spans.append(inner.get("span_gpus"))
+        self.force_scale_outs.append(inner.get("force_scale_out"))
         self.databases.append(database)
         volume = int(op._h) * 2
         return PerformanceResult(latency=float(volume) * self._factors.get(id(database), 1.0), energy=0.0)
 
 
-def _probe_span(op) -> int | None:
-    """The span recorded on a Rust-backed ``P2P`` probe."""
+def _probe_spec(op) -> dict:
+    """The probe op's serialized spec payload -- its Rust-side state."""
     import json
 
     spec = json.loads(op._spec_json())
-    inner = spec.get("P2P") or next(iter(spec.values()))
-    return inner.get("span_gpus")
+    return spec.get("P2P") or next(iter(spec.values()))
+
+
+def _probe_span(op) -> int | None:
+    """The span recorded on a Rust-backed ``P2P`` probe."""
+    return _probe_spec(op).get("span_gpus")
 
 
 class TestAFDTransferSpan:
@@ -362,10 +369,82 @@ class TestHeteroTimesSupernode:
         assert float(op.query(self.A_DB, x=1024, peer_database=self.A_DB)) == float(op.query(self.A_DB, x=1024))
 
 
+class TestCrossSystemForceScaleOut:
+    """``force_scale_out=True``: cross-system pairs skip rack-local tiers.
+
+    Pools on different systems (gb200 attention + gb300 FFN) never share an
+    NVLink domain, so the flag -- not the span -- decides their tier. The
+    span still rides along on the probe; the engine simply ignores it.
+    """
+
+    _KW: ClassVar[dict] = {
+        "hidden_size": 4096,
+        "n_a_workers": 68,
+        "n_f_workers": 4,
+        "gpus_per_node": 4,
+        "f_gpus_per_node": 8,
+        "num_experts": 128,
+        "topk": 8,
+    }
+
+    A_DB = object()
+    F_DB = object()
+
+    @pytest.fixture()
+    def engine(self, monkeypatch) -> _SpanRecordingEngine:
+        stub = _SpanRecordingEngine()
+        monkeypatch.setattr(afd_transfer_module, "_engine_comm_query", stub)
+        return stub
+
+    def _op(self, span, **overrides):
+        kw = {**self._KW, **overrides}
+        return AFDTransfer(name="a2f", scale_factor=1.0, direction="a2f", span_gpus=span, **kw)
+
+    def test_default_leaves_tiering_to_the_span(self, engine):
+        """An unset flag must reach the engine as ``false``, not as a missing key."""
+        op = self._op(8)
+        assert op.force_scale_out is False
+        op.query(self.A_DB, x=64)
+        assert engine.force_scale_outs == [False]
+
+    def test_flag_reaches_the_probe_on_both_sides(self, engine):
+        """Bottleneck pricing evaluates both databases; both must get the flag."""
+        op = self._op(8, force_scale_out=True)
+        assert op.force_scale_out is True
+        op.query(self.A_DB, x=64, peer_database=self.F_DB)
+        assert engine.force_scale_outs == [True, True]
+        assert engine.spans == [8, 8]  # span still carried; the flag overrides it
+
+    def test_flag_compose_with_any_span(self, engine):
+        """True is meaningful with every span shape, including no span at all."""
+        for span in (None, 8, 144):
+            self._op(span, force_scale_out=True).query(self.A_DB, x=64)
+        assert engine.force_scale_outs == [True, True, True]
+        assert engine.spans == [None, 8, 144]
+
+
 class TestSessionSpanWiring:
     """The session owns span derivation; the op only carries it."""
 
-    def _comm_ops(self, *, n_a_nodes, n_f_nodes, a_gpus_per_node=4, f_gpus_per_node=4):
+    def _comm_ops(
+        self,
+        *,
+        n_a_nodes,
+        n_f_nodes,
+        a_gpus_per_node=4,
+        f_gpus_per_node=4,
+        a_system="gb200",
+        f_system="gb200",
+    ):
+        """Build comm ops from a ``__new__`` session with stub databases.
+
+        ``a_system`` / ``f_system``: a string attaches
+        ``SimpleNamespace(system=<str>)``, ``None`` attaches no database at
+        all, anything else is attached verbatim (e.g. a ``SimpleNamespace()``
+        without a ``system`` attribute). The session requires both pool
+        databases to state their systems, so the fixtures default to a
+        homogeneous pair.
+        """
         from aiconfigurator.sdk.config import AFDConfig
         from aiconfigurator.sdk.inference_session import AFDInferenceSession
 
@@ -382,6 +461,10 @@ class TestSessionSpanWiring:
         session._afd_config = cfg
         session._a_model_config = SimpleNamespace(comm_quant_mode=common.CommQuantMode.half)
         session._f_model_config = SimpleNamespace(comm_quant_mode=common.CommQuantMode.half)
+        for attr, value in (("_a_database", a_system), ("_f_database", f_system)):
+            if value is None:
+                continue
+            setattr(session, attr, SimpleNamespace(system=value) if isinstance(value, str) else value)
         model = SimpleNamespace(_hidden_size=4096, _num_experts=128, _topk=8)
         return session._build_afd_comm_ops(model, model)
 
@@ -413,6 +496,44 @@ class TestSessionSpanWiring:
         for op in (ops.f_ag, ops.f_rs, ops.a_combine):
             assert not hasattr(op, "span_gpus")
 
+    def test_cross_system_pools_force_scale_out(self):
+        """gb200 attention + gb300 FFN: forced scale-out, span still derived."""
+        ops = self._comm_ops(n_a_nodes=1, n_f_nodes=1, a_system="gb200", f_system="gb300")
+        assert ops.a2f.force_scale_out is True
+        assert ops.f2a.force_scale_out is True
+        assert ops.a2f.span_gpus == 8  # carried, but the flag overrides it
+
+    def test_same_system_hetero_pools_keep_span_tiering(self):
+        """Different backend/version on ONE system can still share a rack."""
+        ops = self._comm_ops(n_a_nodes=1, n_f_nodes=1, a_system="gb200", f_system="gb200")
+        assert ops.a2f.force_scale_out is False
+        assert ops.f2a.force_scale_out is False
+
+    def test_sessions_without_databases_are_rejected(self):
+        """No pool databases at all: the session cannot state the systems."""
+        with pytest.raises(ValueError, match="`system` names"):
+            self._comm_ops(n_a_nodes=1, n_f_nodes=1, a_system=None, f_system=None)
+
+    def test_a_single_missing_pool_database_is_rejected(self):
+        """One pool database present, the other absent -- still no answer."""
+        with pytest.raises(ValueError, match="`system` names"):
+            self._comm_ops(n_a_nodes=1, n_f_nodes=1, a_system=None, f_system="gb300")
+
+    def test_databases_without_a_system_attribute_are_rejected(self):
+        """Databases that cannot state their system must fail loudly.
+
+        A silent default would price a genuinely cross-system pair on NVLink
+        -- the optimistic error the flag exists to remove.
+        """
+        with pytest.raises(ValueError, match="`system` names"):
+            self._comm_ops(n_a_nodes=1, n_f_nodes=1, a_system=SimpleNamespace(), f_system=SimpleNamespace())
+
+    def test_flag_leaves_the_node_local_ops_alone(self):
+        """AG/RS and a_combine never take the flag, exactly like the span."""
+        ops = self._comm_ops(n_a_nodes=1, n_f_nodes=1, a_system="gb200", f_system="gb300")
+        for op in (ops.f_ag, ops.f_rs, ops.a_combine):
+            assert not hasattr(op, "force_scale_out")
+
 
 # ---------------------------------------------------------------------------
 # The compiled engine actually honors the span
@@ -435,11 +556,18 @@ def rack_database():
     return db
 
 
-def _engine_p2p(database, message_bytes: int, span: int | None) -> float:
+def _engine_p2p(database, message_bytes: int, span: int | None, *, force_scale_out: bool = False) -> float:
     """One P2P probe through the real engine, exactly as ``AFDTransfer`` does."""
     from aiconfigurator_core.sdk.operations.communication import P2P
 
-    probe = P2P("probe", 1.0, -(-message_bytes // 2), 2, span_gpus=span)
+    probe = P2P(
+        "probe",
+        1.0,
+        -(-message_bytes // 2),
+        2,
+        span_gpus=span,
+        force_scale_out=force_scale_out,
+    )
     return float(afd_transfer_module._engine_comm_query(database, probe))
 
 
@@ -521,6 +649,50 @@ class TestEngineHonorsTheSpan:
             pytest.skip(f"{_ENGINE_SYSTEM} has no distinct inter_rack_bw")
         assert across > within
         assert priced(None) == pytest.approx(within, rel=1e-12)
+
+
+class TestEngineHonorsForceScaleOut:
+    """End-to-end: the flag moves a within-rack span onto the scale-out fabric.
+
+    The session-side wiring is covered by TestSessionSpanWiring; here the
+    engine itself must honor ``force_scale_out=True`` -- a Rust-side
+    regression in the override (or a flag that stops reaching it) fails here.
+    """
+
+    _BYTES = 1 << 20
+
+    def test_forced_scale_out_pricing_matches_inter_rack(self, rack_database):
+        node = rack_database.system_spec["node"]
+        per_rack = node["num_gpus_per_rack"]
+        inter_rack_bw = node.get("inter_rack_bw")
+        if not inter_rack_bw or inter_rack_bw == node["inter_node_bw"]:
+            pytest.skip(f"{_ENGINE_SYSTEM} has no distinct inter_rack_bw")
+
+        # A span comfortably inside the rack would price NVLink; the flag
+        # must reprice it on the scale-out pair instead. Expected value
+        # derives the latency through ``get_p2p_latency`` (owner of the tier
+        # definition, clamp included), not the raw yaml key.
+        latency = rack_database.system_spec.get_p2p_latency(per_rack + 1)
+        expected = ((-(-self._BYTES // 2)) * 2 / inter_rack_bw + latency) * 1000.0
+        priced = _engine_p2p(rack_database, self._BYTES, per_rack, force_scale_out=True)
+        assert priced == pytest.approx(expected, rel=1e-9)
+        assert priced > _engine_p2p(rack_database, self._BYTES, per_rack)
+
+    def test_forced_scale_out_ignores_the_span_entirely(self, rack_database):
+        """None, within-rack, and over-rack spans all land on the same price."""
+        per_rack = rack_database.system_spec["node"]["num_gpus_per_rack"]
+        prices = {
+            _engine_p2p(rack_database, self._BYTES, span, force_scale_out=True)
+            for span in (None, per_rack, per_rack + 1)
+        }
+        assert len(prices) == 1
+
+    def test_default_flag_on_a_within_rack_span_is_untouched(self, rack_database):
+        """Guarding the guard: the opt-out must not leak into the default path."""
+        per_rack = rack_database.system_spec["node"]["num_gpus_per_rack"]
+        default = _engine_p2p(rack_database, self._BYTES, per_rack)
+        explicit = _engine_p2p(rack_database, self._BYTES, per_rack, force_scale_out=False)
+        assert explicit == pytest.approx(default, rel=1e-12)
 
 
 class TestCrossRackLatencyCannotBeatSameRack:

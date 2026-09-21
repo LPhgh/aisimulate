@@ -430,6 +430,12 @@ pub struct P2POp {
     /// by the ENGINE_SPEC_SCHEMA_VERSION 19 bump.
     #[serde(default)]
     pub span_gpus: Option<u32>,
+    /// Force the link onto the scale-out fabric, skipping the rack-local
+    /// tiers regardless of `span_gpus`: `inter_rack_bw` when declared,
+    /// `inter_node_bw` otherwise. Cross-system AFD pool pairs (e.g. gb200
+    /// attention + gb300 FFN) take this path.
+    #[serde(default)]
+    pub force_scale_out: bool,
 }
 
 impl P2POp {
@@ -441,6 +447,7 @@ impl P2POp {
             hidden_size,
             seq_split: 1,
             span_gpus: None,
+            force_scale_out: false,
         }
     }
 
@@ -471,9 +478,16 @@ impl P2POp {
         // across racks) and is a modeling extension rather than a fix; tracked
         // separately. Until then the bias is one-directional: tiering can only
         // penalise width, never flatter it.
-        let (inter_bw, latency) = match self.span_gpus {
-            None => (spec.node.inter_node_bw, spec.node.p2p_latency),
-            Some(span) => (spec.get_p2p_bandwidth(span), spec.get_p2p_latency(span)),
+        let (inter_bw, latency) = match (self.span_gpus, self.force_scale_out) {
+            (None, false) => (spec.node.inter_node_bw, spec.node.p2p_latency),
+            (Some(span), false) => (spec.get_p2p_bandwidth(span), spec.get_p2p_latency(span)),
+            (_, true) => (
+                // u32::MAX = "span beyond any rack": lands the tier selectors
+                // on their last step (inter_rack, or inter_node on rack-less
+                // specs) without duplicating their fallback/clamp rules here.
+                spec.get_p2p_bandwidth(u32::MAX),
+                spec.get_p2p_latency(u32::MAX),
+            ),
         };
         let inter_bw = inter_bw.max(1.0);
         // The P2P SOL_FULL triple is `(sol_time, 0, sol_time)` — the
@@ -855,5 +869,84 @@ mod tests {
             (bytes / spec.node.inter_node_bw + spec.node.p2p_latency) * 1000.0
         );
         assert_eq!(empirical.source, Source::Empirical);
+    }
+
+    /// Cross-system AFD pool pairs never share a scale-up domain: the flag
+    /// must skip the rack-local tiers and price the scale-out fabric no
+    /// matter what span (or none) the op carries. Oracle hand-derived from
+    /// the synthetic node spec below: `bytes / inter_rack_bw +
+    /// inter_rack_latency` (no clamp — 30us >= the 10us p2p_latency).
+    #[test]
+    fn p2p_force_scale_out_prices_scale_out_regardless_of_span() {
+        let mut db = b200_vllm_db();
+        {
+            let node = &mut db.tables_mut().system_spec.node;
+            node.num_gpus_per_node = 4;
+            node.intra_node_bw = 900e9;
+            node.inter_node_bw = 900e9;
+            node.num_gpus_per_rack = Some(72);
+            node.inter_rack_bw = Some(50e9);
+            node.p2p_latency = 10e-6;
+            node.inter_rack_latency = Some(30e-6);
+        }
+        db.database_mode = DatabaseMode::Empirical;
+        let bytes = 128.0 * 8192.0 * 2.0;
+        let expected = (bytes / 50e9 + 30e-6) * 1000.0;
+        for span in [None, Some(8), Some(72), Some(144)] {
+            let p2p = P2POp {
+                span_gpus: span,
+                force_scale_out: true,
+                ..P2POp::new("p2p", 2, 8192)
+            };
+            let result = p2p.query(&db, 128).expect("p2p query");
+            assert_eq!(
+                result.latency_ms, expected,
+                "span {span:?} must not reach the rack-local tiers"
+            );
+        }
+        // Same span WITHOUT the flag still hits the rack-local tier —
+        // the override, not the spec, makes the difference.
+        let local = P2POp {
+            span_gpus: Some(8),
+            ..P2POp::new("p2p", 2, 8192)
+        };
+        let result = local.query(&db, 128).expect("p2p query");
+        assert_eq!(result.latency_ms, (bytes / 900e9 + 10e-6) * 1000.0);
+    }
+
+    /// No rack tier declared: forced scale-out pricing falls back to
+    /// `inter_node_bw` — the same value the default path reports, so flat
+    /// systems are untouched by the flag.
+    #[test]
+    fn p2p_force_scale_out_falls_back_to_inter_node_without_rack_tier() {
+        let mut db = b200_vllm_db();
+        db.database_mode = DatabaseMode::Empirical;
+        let spec = db.system_spec.clone();
+        let cross = P2POp {
+            span_gpus: Some(8),
+            force_scale_out: true,
+            ..P2POp::new("p2p", 2, 8192)
+        };
+        let bytes = 128.0 * 8192.0 * 2.0;
+        let result = cross.query(&db, 128).expect("p2p query");
+        assert_eq!(
+            result.latency_ms,
+            (bytes / spec.node.inter_node_bw + spec.node.p2p_latency) * 1000.0
+        );
+    }
+
+    /// JSON specs predating the field must deserialize onto the old path.
+    #[test]
+    fn p2p_json_without_the_flag_defaults_to_no_override() {
+        let json = serde_json::json!({
+            "name": "p2p",
+            "scale_factor": 1.0,
+            "pp_size": 2,
+            "hidden_size": 8192,
+            "seq_split": 1,
+            "span_gpus": null,
+        });
+        let op: P2POp = serde_json::from_value(json).expect("deserialize");
+        assert!(!op.force_scale_out);
     }
 }

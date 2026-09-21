@@ -111,6 +111,16 @@ class AFDTransfer(PythonOperation):
     hetero pools can disagree on it), then bottleneck pricing picks the
     slower of the two tier-resolved latencies.
 
+    ``force_scale_out=True`` is the cross-system exception: pools on
+    different systems (e.g. gb200 attention + gb300 FFN) can never share an
+    NVLink domain -- NVL72 racks are single-generation -- so their traffic
+    rides the scale-out fabric no matter how small the combined span is.
+    Both sides then skip the rack-local tiers and resolve ``inter_rack_bw``
+    (falling back to ``inter_node_bw``) from their own spec. The default
+    ``False`` merely leaves tier selection to ``span_gpus`` -- which may
+    itself pick a scale-out tier for a wide-enough span, e.g. past the node
+    width on flat 8-GPU/node systems.
+
     Known conservatism: ``span_gpus`` is the pool pair's TOTAL span, and the
     tier it selects is applied to every cross-pool link. A deployment that
     spills just past a rack boundary has only a small fraction of pairs
@@ -134,6 +144,7 @@ class AFDTransfer(PythonOperation):
         gpus_per_node: int = 8,
         f_gpus_per_node: int | None = None,
         span_gpus: int | None = None,
+        force_scale_out: bool = False,
         num_experts: int = 0,
         topk: int = 0,
         comm_quant_mode: Optional[common.CommQuantMode] = None,
@@ -153,6 +164,10 @@ class AFDTransfer(PythonOperation):
         # GPUs spanned by the A+F pools together, used to pick the fabric
         # tier. None keeps the flat inter_node_bw pricing.
         self._span_gpus = max(int(span_gpus), 1) if span_gpus else None
+        # True declares the link must be priced scale-out regardless of
+        # span -- the cross-system case, where the pools live in different
+        # scale-up (NVLink) domains.
+        self._force_scale_out = bool(force_scale_out)
         self._num_experts = max(int(num_experts), 0)
         self._topk = max(int(topk), 0)
         self._comm_quant_mode = comm_quant_mode or common.CommQuantMode.half
@@ -173,6 +188,11 @@ class AFDTransfer(PythonOperation):
         """GPUs spanned by the A+F pools, or ``None`` for flat pricing."""
         return self._span_gpus
 
+    @property
+    def force_scale_out(self) -> bool:
+        """True when the link is priced scale-out regardless of span."""
+        return self._force_scale_out
+
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
         x = int(kwargs.get("x", 0))
         if x <= 0:
@@ -189,8 +209,16 @@ class AFDTransfer(PythonOperation):
         # P2P link is charged regardless of the actual pp depth. ``span_gpus``
         # selects the fabric tier inside the engine -- None keeps the flat
         # inter-node pricing, which is what a caller that does not care about
-        # tiers wants.
-        probe = P2P("afd_p2p", 1.0, -(-per_link_bytes // 2), 2, span_gpus=self._span_gpus)
+        # tiers wants. ``force_scale_out`` overrides tiering outright:
+        # cross-system pairs are priced scale-out whatever the span says.
+        probe = P2P(
+            "afd_p2p",
+            1.0,
+            -(-per_link_bytes // 2),
+            2,
+            span_gpus=self._span_gpus,
+            force_scale_out=self._force_scale_out,
+        )
         result = _engine_comm_query(database, probe)
         peer_database = kwargs.get("peer_database")
         if peer_database is not None and peer_database is not database:

@@ -122,7 +122,9 @@ mod tests {
         // v18: speculative attention width fields and FpmForward verify_width.
         // v19: P2POp gained span_gpus (AFD super-node fabric tiering) — a
         //     positional bincode op-layout change.
-        assert_eq!(ENGINE_SPEC_SCHEMA_VERSION, 19);
+        // v20: P2POp gained force_scale_out (AFD cross-system fabric
+        //     fix) — a positional bincode op-layout change.
+        assert_eq!(ENGINE_SPEC_SCHEMA_VERSION, 20);
         assert_eq!(FPM_VERSION, 1);
         assert_eq!(ForwardPassMetrics::default().version, FPM_VERSION);
     }
