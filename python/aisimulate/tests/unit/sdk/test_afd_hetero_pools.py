@@ -404,6 +404,22 @@ class TestTaskPoolResolution:
         assert task._afd_gpus_per_node == 8
         assert task._afd_f_gpus_per_node == 4
 
+    def test_prefill_pool_override_shapes_parallel_candidates(self):
+        """Regression: the static prefill pool's parallel search space must be
+        enumerated against the pool's own system, not the top-level one. Dense
+        models on gb200/gb300 extend tp/num_gpu to 16 while h200_sxm caps at 8,
+        so a top-level h200_sxm + prefill gb200 task must offer tp=16."""
+        task = _afd_task(afd_prefill_system_name="gb200")
+        assert 16 in task.prefill_tp_candidates
+        assert 16 in task.prefill_num_gpu_candidates
+
+    def test_prefill_pool_inherits_top_level_parallel_candidates(self):
+        """Homogeneous guard: without an override the prefill search space is
+        exactly the plain top-level one (dense h200_sxm caps tp at 8)."""
+        task = _afd_task()
+        assert task.prefill_tp_candidates == [1, 2, 4, 8]
+        assert task.prefill_num_gpu_candidates == [1, 2, 4, 8]
+
     def test_pool_backend_version_resolved_independently(self):
         """A pool that moves hardware resolves its own DB version and shares the
         top-level backend."""

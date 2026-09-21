@@ -2098,7 +2098,8 @@ class Task:
             prefill_cfg, _ = build_disagg_parallel_lists(
                 backend_name=self.backend_name,
                 is_moe=self._is_moe,
-                prefill_system=self.system_name,
+                # The static prefill pool may sit on its own hardware.
+                prefill_system=self.afd_pool_attr("afd_prefill", "system_name"),
                 decode_system=self.system_name,
                 prefill_enable_wideep=self.enable_wideep,
                 decode_enable_wideep=self.enable_wideep,
