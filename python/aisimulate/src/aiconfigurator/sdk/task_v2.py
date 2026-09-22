@@ -1661,7 +1661,16 @@ class Task:
 
         Large-EP model construction raises when it is missing rather than
         assuming 8 (``models.helpers.large_ep_gpus_per_node``)."""
-        spec = load_system_spec(self._role_attr(role, "system_name"))
+        # AFD mirrors the top-level system onto ``prefill_system_name`` even when
+        # the afd_prefill pool overrides it (see _resolve_afd_search), so for that
+        # one role the attribute names the wrong yaml. Ask the pool instead --
+        # afd_pool_attr reads constructor-set fields, so this needs no ordering
+        # guarantee against _resolve_afd_search.
+        if self.serving_mode == "afd" and role == "prefill":
+            system = self.afd_pool_attr("afd_prefill", "system_name")
+        else:
+            system = self._role_attr(role, "system_name")
+        spec = load_system_spec(system)
         return int(spec.get("node", {}).get("num_gpus_per_node", 0) or 0) or None
 
     def _try_load_database(self, system: str, backend: str, version: str, *, label: str):
@@ -2590,7 +2599,18 @@ class Task:
                     # instead of the overridden pool's (what the sweep runs on).
                     self._check_role_against_db("prefill", validate_context=True, validate_generation=False, pool=pool)
                 else:
-                    self._check_role_against_db("agg", validate_context=True, validate_generation=True, pool=pool)
+                    # ``afd_f``, the only other pool afd_pool_overrides reports.
+                    # It re-resolves its system-dependent modes against its own
+                    # hardware, so validate THOSE against its DB -- the agg modes
+                    # checked above describe a configuration the F pool will
+                    # never price.
+                    self._check_role_against_db(
+                        "agg",
+                        validate_context=True,
+                        validate_generation=True,
+                        pool=pool,
+                        mode_overrides=self._afd_f_effective_quant_modes(),
+                    )
         else:
             self._check_role_against_db("prefill", validate_context=True, validate_generation=False)
             self._check_role_against_db("decode", validate_context=False, validate_generation=True)
@@ -2602,12 +2622,18 @@ class Task:
         validate_context: bool,
         validate_generation: bool,
         pool: str | None = None,
+        mode_overrides: dict[str, Any] | None = None,
     ) -> None:
         """For one role, fetch its perf DB and verify each quant mode is supported.
 
         ``pool`` (AFD only) redirects the system/backend/version lookup to that
         AFD pool while keeping ``role``'s quant modes and parallel tuples. It is
         how an A or F pool on different hardware gets its own DB validated.
+
+        ``mode_overrides`` replaces individual quant modes instead of reading
+        them off the role. A pool that re-resolves its modes against its own
+        hardware needs it: validating the role's values against that pool's DB
+        checks a configuration nothing will ever price.
         """
         from aiconfigurator.sdk.errors import UnsupportedWideepConfigError
 
@@ -2619,6 +2645,16 @@ class Task:
             version = self._role_attr(role, "backend_version")
         if not (system and backend and version):
             return  # nothing to validate against
+
+        def _mode(name: str) -> Any:
+            if mode_overrides is not None and name in mode_overrides:
+                return mode_overrides[name]
+            return self._role_attr(role, name)
+
+        # Only GEMM/MoE are re-resolved per pool today, and GEMM is read twice
+        # (the fp8_static preflight below and the table check), so hoist those.
+        gemm_mode = _mode("gemm_quant_mode")
+        moe_mode = _mode("moe_quant_mode")
 
         # DB unavailable; let sweep surface the real error later.
         if pool is not None:
@@ -2632,7 +2668,7 @@ class Task:
             # so fail fast rather than defer to a late run() failure.  Other modes
             # (and other quant modes) keep deferring to the sweep.
             if self.database_mode in (None, common.DatabaseMode.SILICON.name) and (
-                self._role_attr(role, "gemm_quant_mode") == common.GEMMQuantMode.fp8_static
+                gemm_mode == common.GEMMQuantMode.fp8_static
             ):
                 raise ValueError(
                     f"fp8_static GEMM mode requires perf data that is unavailable for "
@@ -2804,7 +2840,7 @@ class Task:
         # GEMM is always validated (applies to all worker shapes). It has the
         # same transfer ladder as MoE (shared primitive), so the same
         # HYBRID/EMPIRICAL relaxation applies.
-        _check("gemm", self._role_attr(role, "gemm_quant_mode"), profile_transfer=True)
+        _check("gemm", gemm_mode, profile_transfer=True)
 
         # MoE — only when model is MoE. The large-EP expert-compute tables are
         # NOT validated here: coverage gating already decided, per tuple and per
@@ -2812,15 +2848,15 @@ class Task:
         # partial-coverage hole is pruned by the sweep's per-tuple guard). Only
         # the fused MoE op, which every task can still reach, is checked.
         if is_moe:
-            _check("moe", self._role_attr(role, "moe_quant_mode"), profile_transfer=True)
+            _check("moe", moe_mode, profile_transfer=True)
 
         # FMHA: only meaningful for context-using workers (agg, prefill).
         if validate_context:
-            _check_attention([ctx for ctx, _gen in attention_op_pairs], self._role_attr(role, "fmha_quant_mode"))
+            _check_attention([ctx for ctx, _gen in attention_op_pairs], _mode("fmha_quant_mode"))
 
         # KV cache: only meaningful for generation-using workers (agg, decode).
         if validate_generation:
-            _check_attention([gen for _ctx, gen in attention_op_pairs], self._role_attr(role, "kvcache_quant_mode"))
+            _check_attention([gen for _ctx, gen in attention_op_pairs], _mode("kvcache_quant_mode"))
 
     # =====================================================================
     # Properties
@@ -3069,6 +3105,41 @@ class Task:
         # estimate path hands to get_model.
         resolve_nvfp4_for_system(cfg, f_system, self.model_path, backend_name=self.backend_name)
         return cfg
+
+    def _afd_f_effective_quant_modes(self) -> dict[str, Any]:
+        """The GEMM/MoE modes the F pool will actually be priced with.
+
+        :meth:`_build_afd_f_model_config` deliberately leaves a re-derivable
+        mode unset so ``get_model``'s checkpoint inference resolves it against
+        the pool's own hardware. Validation cannot check ``None`` -- ``_check``
+        skips it -- so fill those in here the same way :meth:`_resolve_quant_modes`
+        fills its HF-base layer: infer from the already-cached raw config, then
+        fall back to the shared default. Returns ``{}`` for a homogeneous F pool,
+        which has no separate resolution to honour.
+        """
+        cfg = self._build_afd_f_model_config()
+        if cfg is None:
+            return {}
+        modes: dict[str, Any] = {}
+        for key, value in (("gemm_quant_mode", cfg.gemm_quant_mode), ("moe_quant_mode", cfg.moe_quant_mode)):
+            if value is not None:
+                modes[key] = value
+        if len(modes) == 2:
+            return modes
+        inferred = _infer_quant_modes_from_raw_config(self._raw_config)
+        architecture = (
+            self._raw_config.get("architectures", [None])[0]
+            if isinstance(self._raw_config.get("architectures"), list)
+            else self._raw_config.get("architecture")
+        )
+        for key in ("gemm_quant_mode", "moe_quant_mode"):
+            if key in modes:
+                continue
+            from_hf = inferred.get(key)
+            if key == "moe_quant_mode":
+                from_hf = resolve_vllm_moe_execution_mode(from_hf, self.backend_name, architecture)
+            modes[key] = from_hf if from_hf is not None else _QUANT_FALLBACKS[key]
+        return modes
 
     def sweep_afd_kwargs(self, *, database) -> dict[str, Any]:
         """Return the exact kwargs needed for sweep.sweep_afd.

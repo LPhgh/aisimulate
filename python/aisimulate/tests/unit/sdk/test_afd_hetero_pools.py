@@ -421,6 +421,25 @@ class TestTaskPoolResolution:
         assert task.prefill_tp_candidates == [1, 2, 4, 8]
         assert task.prefill_num_gpu_candidates == [1, 2, 4, 8]
 
+    def test_prefill_pool_node_width_comes_from_its_own_system(self):
+        """The candidates above are gb200-shaped, so the prefill ModelConfig must
+        carry gb200's node width too -- ``prefill_system_name`` mirrors the top
+        level (h200_sxm, 8 GPUs/node) while the pool is 4. ``num_gpus_per_node``
+        is the hardware fact large-EP construction takes its comm node span
+        from; AFD does not wire large-EP into the prefill pool yet, so this pins
+        the declared fact rather than a priced number."""
+        task = _afd_task(afd_prefill_system_name="gb200")
+        assert task._num_gpus_per_node("prefill") == 4
+        assert task.build_model_config(role="prefill").num_gpus_per_node == 4
+        # The A pool is the top-level system and keeps its own width.
+        assert task._num_gpus_per_node("agg") == 8
+
+    def test_prefill_pool_node_width_inherits_top_level_when_homogeneous(self):
+        """Homogeneous guard: no override, no change to the prefill width."""
+        task = _afd_task()
+        assert task._num_gpus_per_node("prefill") == 8
+        assert task.build_model_config(role="prefill").num_gpus_per_node == 8
+
     def test_pool_backend_version_resolved_independently(self):
         """A pool that moves hardware resolves its own DB version and shares the
         top-level backend."""
@@ -1011,6 +1030,51 @@ class TestPoolQuantReResolution:
 
         homo = _nvfp4_afd_task(afd_combined_with_pd=False)
         assert homo.sweep_afd_kwargs(database=shared)["f_model_config"] is None
+
+
+class TestPoolQuantValidation:
+    """``validate()`` must check the F pool's OWN resolution against the F DB.
+
+    ``_check_role_against_db(pool="afd_f")`` redirects only the DB lookup, so
+    without the re-resolved modes it validates the A system's answer -- a
+    configuration the F pool never prices. The F template cannot be passed
+    straight in either: it leaves the re-derivable modes unset for ``get_model``,
+    and ``_check`` skips ``None``, which would silently un-validate the pool.
+    """
+
+    def test_effective_modes_are_the_f_pools_own(self):
+        """Blackwell F pool: the modes pricing will use are the checkpoint's
+        native nvfp4, not the Hopper A pool's downgrade."""
+        task = _nvfp4_afd_task(afd_f_system_name="b200_sxm")
+        assert task.gemm_quant_mode == common.GEMMQuantMode.nvfp4_wo
+        assert task._afd_f_effective_quant_modes() == {
+            "gemm_quant_mode": common.GEMMQuantMode.nvfp4,
+            "moe_quant_mode": common.MoEQuantMode.nvfp4,
+        }
+
+    def test_effective_modes_follow_a_hopper_f_pool(self):
+        """Reverse pairing: the F pool takes the downgrade its own hardware
+        requires, even though the Blackwell A pool keeps native nvfp4."""
+        task = _nvfp4_afd_task(system_name="b200_sxm", afd_f_system_name="h200_sxm")
+        assert task.gemm_quant_mode == common.GEMMQuantMode.nvfp4
+        effective = task._afd_f_effective_quant_modes()
+        assert effective["gemm_quant_mode"] == common.GEMMQuantMode.nvfp4_wo
+        assert effective["moe_quant_mode"] == common.MoEQuantMode.nvfp4_wo
+
+    def test_homogeneous_f_pool_has_no_overrides(self):
+        """No override -> empty dict, so validation reads the role exactly as
+        before and the homogeneous path is unchanged."""
+        assert _nvfp4_afd_task()._afd_f_effective_quant_modes() == {}
+
+    def test_validate_reports_the_f_pools_mode_not_the_a_pools(self):
+        """End-to-end: h200_sxm carries no FP4 gemm lane on any backend, so this
+        pairing must be rejected -- and the rejection must name ``nvfp4_wo``, the
+        Hopper F pool's own resolution, not the ``nvfp4`` the Blackwell A pool
+        uses (whose check has already passed by then). That the mode name moved
+        is what proves the override reaches ``_check`` instead of the role."""
+        task = _nvfp4_afd_task(system_name="b200_sxm", afd_f_system_name="h200_sxm")
+        with pytest.raises(ValueError, match=r"gemm quant mode 'nvfp4_wo'.*h200_sxm"):
+            task.validate()
 
 
 class TestAfdParetoQuantWiring:
