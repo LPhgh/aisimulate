@@ -431,14 +431,13 @@ class TestSessionSpanWiring:
         a_system="gb200",
         f_system="gb200",
     ):
-        """Build comm ops from a ``__new__`` session with stub databases.
+        """Build comm ops from a ``__new__`` session with resolved pool names.
 
-        ``a_system`` / ``f_system``: a string attaches
-        ``SimpleNamespace(system=<str>)``, ``None`` attaches no database at
-        all, anything else is attached verbatim (e.g. a ``SimpleNamespace()``
-        without a ``system`` attribute). The session requires both pool
-        databases to state their systems, so the fixtures default to a
-        homogeneous pair.
+        ``a_system`` / ``f_system`` are the system names ``__init__`` would have
+        resolved onto the session; ``None`` stands for a pool whose database
+        could not state its system, which ``__init__`` records as ``""``. The
+        session requires both names, so the fixtures default to a homogeneous
+        pair.
         """
         from aiconfigurator.sdk.config import AFDConfig
         from aiconfigurator.sdk.inference_session import AFDInferenceSession
@@ -456,10 +455,8 @@ class TestSessionSpanWiring:
         session._afd_config = cfg
         session._a_model_config = SimpleNamespace(comm_quant_mode=common.CommQuantMode.half)
         session._f_model_config = SimpleNamespace(comm_quant_mode=common.CommQuantMode.half)
-        for attr, value in (("_a_database", a_system), ("_f_database", f_system)):
-            if value is None:
-                continue
-            setattr(session, attr, SimpleNamespace(system=value) if isinstance(value, str) else value)
+        session._a_system_name = a_system or ""
+        session._f_system_name = f_system or ""
         model = SimpleNamespace(_hidden_size=4096, _num_experts=128, _topk=8)
         return session._build_afd_comm_ops(model, model)
 
@@ -504,24 +501,20 @@ class TestSessionSpanWiring:
         assert ops.a2f.force_scale_out is False
         assert ops.f2a.force_scale_out is False
 
-    def test_sessions_without_databases_are_rejected(self):
-        """No pool databases at all: the session cannot state the systems."""
-        with pytest.raises(ValueError, match="`system` names"):
-            self._comm_ops(n_a_nodes=1, n_f_nodes=1, a_system=None, f_system=None)
-
-    def test_a_single_missing_pool_database_is_rejected(self):
-        """One pool database present, the other absent -- still no answer."""
-        with pytest.raises(ValueError, match="`system` names"):
-            self._comm_ops(n_a_nodes=1, n_f_nodes=1, a_system=None, f_system="gb300")
-
-    def test_databases_without_a_system_attribute_are_rejected(self):
-        """Databases that cannot state their system must fail loudly.
+    def test_pools_that_cannot_state_their_system_are_rejected(self):
+        """A pool whose database carries no ``system`` resolves to ``""``, and
+        both pools empty must fail loudly.
 
         A silent default would price a genuinely cross-system pair on NVLink
         -- the optimistic error the flag exists to remove.
         """
         with pytest.raises(ValueError, match="`system` names"):
-            self._comm_ops(n_a_nodes=1, n_f_nodes=1, a_system=SimpleNamespace(), f_system=SimpleNamespace())
+            self._comm_ops(n_a_nodes=1, n_f_nodes=1, a_system=None, f_system=None)
+
+    def test_a_single_unnamed_pool_is_rejected(self):
+        """One pool named, the other not -- still no answer."""
+        with pytest.raises(ValueError, match="`system` names"):
+            self._comm_ops(n_a_nodes=1, n_f_nodes=1, a_system=None, f_system="gb300")
 
     def test_flag_leaves_the_node_local_ops_alone(self):
         """AG/RS and a_combine never take the flag, exactly like the span."""

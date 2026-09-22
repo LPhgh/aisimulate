@@ -1305,18 +1305,16 @@ class AFDInferenceSession:
         # at all. The cross-pool transfers move tokens regardless.
         span_gpus = cfg.n_a_nodes * cfg.effective_a_gpus_per_node + cfg.n_f_nodes * cfg.effective_f_gpus_per_node
         # A pool pair on DIFFERENT systems (gb200 attention + gb300 FFN) can
-        # never share a scale-up NVLink domain.
-        a_db = getattr(self, "_a_database", None)
-        f_db = getattr(self, "_f_database", None)
-        a_system = getattr(a_db, "system", None)
-        f_system = getattr(f_db, "system", None)
-        if not a_system or not f_system:
+        # never share a scale-up NVLink domain. Both names were resolved once in
+        # __init__ (honouring an explicit f_system_name override); "" means the
+        # database could not state its system.
+        if not self._a_system_name or not self._f_system_name:
             raise ValueError(
                 "AFD pool databases must expose their `system` names: the cross-system "
                 "fabric check prices NVLink vs scale-out on them, and a silent default "
                 "would flatter cross-system deployments."
             )
-        force_scale_out = f_db is not a_db and a_system != f_system
+        force_scale_out = self._a_system_name != self._f_system_name
         # F-side collectives (f_ag / f_rs) price on the F pool's comm quant mode;
         # the a2f / f2a transfers and the A-side combine stay on the A pool's.
         f_shared = {**shared, "comm_quant_mode": f_comm_quant}
