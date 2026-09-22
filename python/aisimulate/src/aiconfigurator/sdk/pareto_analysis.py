@@ -1061,7 +1061,9 @@ def afd_pareto(
     quant modes are system-dependent (the nvfp4 hardware ladder, arch-specific
     MoE kernels), so a pool on different hardware cannot inherit the
     A-system-resolved modes in ``model_config``. Unset (homogeneous F pool)
-    falls back to ``model_config``.
+    falls back to ``model_config``. ``quant_modes`` takes precedence over BOTH
+    templates: an entry set there overwrites the same mode on the F template,
+    undoing its per-system resolution, so pass one or the other.
 
     OOM candidates and per-candidate failures are skipped. Returns a
     DataFrame with :data:`common.ColumnsAFD` columns sorted by

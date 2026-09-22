@@ -3034,10 +3034,13 @@ class Task:
         if f_system == self.system_name:
             return None
         cfg = self.build_model_config(role="agg")
-        # Re-derive only the system-dependent modes, and only when the user did
-        # not pin them: an explicit value is the user's contract (validate stays
-        # fail-fast on it). FMHA/KV-cache are not part of the nvfp4 hardware
-        # ladder, and the F pool never runs FMHA at all.
+        # RE-DERIVATION respects explicit values: the GPT-OSS promotion and the
+        # arch-specific MoE kernels are inference rules, and an explicit mode is
+        # the user's contract (validate stays fail-fast on it). The nvfp4
+        # hardware ladder below is NOT such a rule -- it applies to explicit
+        # values too, exactly as the A side's _apply_fmha_data_fallback does.
+        # FMHA/KV-cache are not part of the ladder, and the F pool never runs
+        # FMHA at all.
         if not self._moe_quant_mode_explicit_by_role.get("agg", False):
             cfg.moe_quant_mode = None
             # GPT-OSS Blackwell promotion re-evaluated against the F pool's
@@ -3057,8 +3060,10 @@ class Task:
             )
         if not self._gemm_quant_mode_explicit_by_role.get("agg", False):
             cfg.gemm_quant_mode = None
-        # Non-Blackwell F pool: re-apply the nvfp4 -> nvfp4_wo ladder (the
-        # helper infers from the checkpoint while the modes are unset).
+        # Non-Blackwell F pool: re-apply the nvfp4 -> nvfp4_wo ladder, which
+        # downgrades an explicit nvfp4 as well (no native FP4 tensor cores, so
+        # the runtime dequantizes regardless of who asked for the mode). While
+        # the modes are unset the helper infers from the checkpoint.
         # Blackwell F pool: no-op, so unset modes stay unset and get_model's
         # checkpoint inference resolves native nvfp4 -- the same state the
         # estimate path hands to get_model.

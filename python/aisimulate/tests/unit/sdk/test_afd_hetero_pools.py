@@ -976,12 +976,28 @@ class TestPoolQuantReResolution:
         assert _nvfp4_afd_task()._build_afd_f_model_config() is None
 
     def test_explicit_mode_is_the_users_contract(self):
-        """A pinned mode survives the re-resolution untouched, per mode: only
-        the unpinned one is re-derived against the pool's system."""
+        """A pinned mode is never RE-DERIVED: only the unpinned one is resolved
+        against the pool's system. (The nvfp4 hardware ladder is a separate
+        matter -- see the next test.)"""
         task = _nvfp4_afd_task(afd_f_system_name="b200_sxm", moe_quant_mode=common.MoEQuantMode.fp8)
         f_cfg = task._build_afd_f_model_config()
         assert f_cfg.moe_quant_mode == common.MoEQuantMode.fp8
         assert f_cfg.gemm_quant_mode is None
+
+    def test_explicit_nvfp4_still_takes_the_hardware_ladder(self):
+        """The nvfp4 -> nvfp4_wo ladder is NOT an inference rule, so it applies
+        to an explicit value too -- deliberately matching the A side, where
+        _apply_fmha_data_fallback downgrades without consulting provenance.
+        Hopper has no native FP4 tensor cores: the runtime dequantizes to BF16
+        before the MMA whoever asked for nvfp4. b200_sxm A keeps the explicit
+        native mode, h200_sxm F does not."""
+        task = _nvfp4_afd_task(
+            system_name="b200_sxm",
+            afd_f_system_name="h200_sxm",
+            gemm_quant_mode=common.GEMMQuantMode.nvfp4,
+        )
+        assert task.build_model_config(role="agg").gemm_quant_mode == common.GEMMQuantMode.nvfp4
+        assert task._build_afd_f_model_config().gemm_quant_mode == common.GEMMQuantMode.nvfp4_wo
 
     def test_sweep_kwargs_forward_the_f_template(self):
         """End-to-end wiring: sweep_afd_kwargs hands the re-resolved template to
