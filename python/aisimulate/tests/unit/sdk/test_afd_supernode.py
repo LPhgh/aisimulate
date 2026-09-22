@@ -230,11 +230,6 @@ def _probe_spec(op) -> dict:
     return spec.get("P2P") or next(iter(spec.values()))
 
 
-def _probe_span(op) -> int | None:
-    """The span recorded on a Rust-backed ``P2P`` probe."""
-    return _probe_spec(op).get("span_gpus")
-
-
 class TestAFDTransferSpan:
     _KW: ClassVar[dict] = {
         "hidden_size": 4096,

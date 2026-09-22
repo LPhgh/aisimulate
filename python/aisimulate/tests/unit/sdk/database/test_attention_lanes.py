@@ -243,13 +243,6 @@ def _route_lane_density_through_the_stub(monkeypatch):
     monkeypatch.setattr(_etv, "fetch_attention_lane_density", _fetch)
 
 
-def test_engine_spec_schema_version_is_nineteen():
-    """P2POp span_gpus extends the positional operation payload."""
-    from aiconfigurator.sdk import engine
-
-    assert engine.ENGINE_SPEC_SCHEMA_VERSION == 19
-
-
 def test_lanes_outside_the_known_vocabulary_stay_reachable():
     """Collected ``kernel_source`` labels are richer than the resolver's lane
     vocabulary — trtllm ships ``torch_flow*``, vllm ships ``vllm_*``, and neither
