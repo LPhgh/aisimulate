@@ -1971,6 +1971,14 @@ def build_experiment_tasks(
         model_path = (
             exp_config.get("model_path") or exp_config.get("prefill_model_path") or exp_config.get("decode_model_path")
         )
+        if serving_mode == "afd":
+            logger.warning(
+                "Skipping experiment '%s': serving_mode 'afd' no longer runs through the "
+                "legacy CLI. AFD runs through the unified CLI: `aisimulate recommend` "
+                "with an `engine.afd` block, then `aisimulate predict`.",
+                exp_name,
+            )
+            continue
         if serving_mode not in {"agg", "disagg"} or not model_path:
             logger.warning("Skipping experiment '%s': missing serving_mode or model_path.", exp_name)
             continue

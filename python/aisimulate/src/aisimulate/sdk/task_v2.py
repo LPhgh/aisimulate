@@ -362,8 +362,9 @@ def build_disagg_parallel_lists(
 
 
 # ---------------------------------------------------------------------------
-# AFD topology enumeration, retained as the parity oracle for
-# aisimulate.sweeper.afd_parallel.enumerate_afd_topologies
+# Frozen legacy AIC AFD topology enumeration, retained as the parity oracle
+# for aisimulate.sweeper.afd_parallel.enumerate_afd_topologies.  Test-only;
+# not part of the public API.
 # ---------------------------------------------------------------------------
 
 
@@ -376,7 +377,7 @@ def _is_valid_afd_moe_ep_size(f_moe_ep_size: int, tp_f: int, num_experts: int) -
     )
 
 
-def build_afd_parallel_lists(
+def _build_afd_parallel_lists(
     total_gpus: int,
     gpus_per_node: int,
     is_moe: bool,
@@ -384,7 +385,11 @@ def build_afd_parallel_lists(
     *,
     search_config: Mapping[str, Any] | None = None,
 ) -> list[tuple[int, int, int, int, int, str]]:
-    """Enumerate AFD candidate topologies for the default-mode sweep.
+    """Enumerate AFD candidate topologies (frozen legacy AIC implementation).
+
+    Retained as the parity oracle for
+    :func:`aisimulate.sweeper.afd_parallel.enumerate_afd_topologies`;
+    not part of the public API.
 
     Returns a list of ``(n_a_nodes, n_f_nodes, tp_a, f_moe_ep_size,
     num_microbatches, pipeline_model)`` tuples.
@@ -458,7 +463,10 @@ def build_afd_parallel_lists(
                                 (n_a_nodes, n_f_nodes, tp_a, f_moe_ep_size, num_microbatches, pipeline_model)
                             )
     if len(candidates) > max_candidates:
-        message = f"AFD default sweep produced {len(candidates)} candidates, exceeding max_candidates={max_candidates}."
+        message = (
+            f"AFD topology enumeration produced {len(candidates)} candidates, "
+            f"exceeding max_candidates={max_candidates}."
+        )
         if candidate_overflow == "truncate":
             logger.warning("%s Truncating deterministically to the first %d candidates.", message, max_candidates)
             candidates = candidates[:max_candidates]
@@ -467,7 +475,7 @@ def build_afd_parallel_lists(
                 f"{message} Narrow the AFD search, increase search_config['max_candidates'], "
                 "or set search_config['candidate_overflow']='truncate'."
             )
-    logger.info("AFD default sweep candidate count: %d", len(candidates))
+    logger.info("AFD topology enumeration candidate count: %d", len(candidates))
     return candidates
 
 
@@ -3013,4 +3021,4 @@ class Task:
         )
 
 
-__all__ = ["ParallelChoice", "Task", "build_afd_parallel_lists"]
+__all__ = ["ParallelChoice", "Task"]
