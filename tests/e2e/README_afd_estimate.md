@@ -1,0 +1,88 @@
+# AFD estimate regression
+
+This CPU-only suite runs fixed queries through the real
+`aisimulate.legacy_cli.api.cli_estimate` entry point and compares public latency
+outputs to frozen targets. It uses the native runtime and bundled performance
+database without mocking estimator results.
+
+From the repository root:
+
+```bash
+uv sync --project python/aisimulate --extra dev
+python/aisimulate/.venv/bin/python -m pytest -p no:timeout \
+  tests/e2e/test_afd_estimate_regression.py \
+  --basetemp=/tmp/afd-estimate-regression --junitxml=/tmp/afd-estimate-results.xml
+```
+
+Use a dedicated `--basetemp` directory: pytest clears it on each run. Each
+executed query writes a JSON record there with the resolved query, baseline
+commit, input commit, target, actual, signed difference, relative difference, path outputs,
+and captured logs. Pytest reports preflight failures separately.
+
+## Configuration and coverage
+
+`afd_estimate_baseline.json` pins Qwen/Qwen3-235B-A22B-FP8 on H200 with SGLang
+0.5.14 in HYBRID mode. The common configuration uses one eight-GPU attention
+node, one eight-GPU FFN node, attention TP=1, FFN EP=8, three microbatches,
+ISL=16000, OSL=64 and six requests per attention worker.
+
+The suite contains 28 query cases (21 numerical and seven rejection cases)
+plus one manifest-integrity test:
+
+- Conservative, optimistic and serial decode.
+- Uneven microbatches and optimistic fallback with two microbatches.
+- Prefill and both phases.
+- Microbatch counts 1 and 4, attention TP 2 and 4, FFN EP 4, and two-node A/F pools.
+- Short/long context, communication factors 0.5/1, FFN boundary assignment, and PD combinations.
+- Invalid pipeline/phase, incompatible both-phase/PD, missing A/F node counts,
+  zero microbatches, and zero attention TP.
+
+Standalone decode compares TPOT, prefill compares TTFT, and both checks each
+separately. PD combinations check both metrics, complementary static/AFD paths,
+and the 24-GPU total budget.
+Targets must be positive and finite. Public SDK latencies are rounded to three
+decimal milliseconds, and the tests compare that output using `actual == target`.
+They also check phase coverage, pipeline metadata, communication hiding,
+microbatch size, worker topology, and rejection type/message/origin.
+
+The integrity test rejects missing, duplicate or unexpected case IDs and
+missing required metrics, path or phase metadata. Individual numerical cases
+also reject an empty or phase-inappropriate metrics dictionary. Model
+configuration, system YAML and H200 database files are checked against SHA-256
+fingerprints, including the database file inventory.
+
+## Baseline lifecycle and scope
+
+The top-level `commit` produced the original nine targets; each added case
+records its own `target_commit` (`69165795` for the 19 added cases).
+Independent subsequent runs verify deterministic regression behavior. Tests never
+regenerate targets.
+Changes to model/database inputs or targets require explicit review and a new
+baseline capture. The current commit field records baseline provenance; it does
+not select or check out that revision during execution.
+
+This is a 28-query matrix for the current API. It is not a claim of one-to-one
+coverage of an external design matrix. It does not implement measured per-step
+accuracy comparison or attribution analysis. Passing these tests
+does not establish agreement with measured GPU latency.
+
+The repository Full CI contracts shard scans root `tests/`, so this suite is
+eligible for collection once committed. Dedicated persistence of the per-case
+JSON files is not configured here. The baseline records the capture Python
+version but does not enforce a complete dependency or runtime fingerprint.
+
+## Baseline provenance
+
+The suite imports the renamed `aisimulate_core` package and the retained
+`aisimulate.legacy_cli.api.cli_estimate` entry point.
+
+`commit` records the original numerical-target provenance (captured with the
+pre-rename `aiconfigurator` packages); `input_commit` records the revision
+whose inputs were fingerprinted (`cab77b9c7888b1c40df8cd3228f5e03c355ef23c`).
+The input refresh changed no numerical targets, path expectations, error
+expectations or query settings. The H200 inventory gained 36 files and lost
+two FPM files; seven retained inputs changed (system YAML and GEMM/MLA data
+or metadata). All 204 current input files are fingerprinted.
+
+The nine original targets were re-verified unchanged on the refreshed inputs
+(Python 3.13.7) before the matrix was extended to 28 cases.
