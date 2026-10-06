@@ -86,3 +86,65 @@ or metadata). All 204 current input files are fingerprinted.
 
 The nine original targets were re-verified unchanged on the refreshed inputs
 (Python 3.13.7) before the matrix was extended to 28 cases.
+
+## Commit-to-commit comparison
+
+`scripts/compare_afd_commits.py` executes this SAME manifest in two independently
+prepared checkouts. It supports both the pre-rename and current Python packages.
+Prepare each checkout with `uv sync --project python/aisimulate --extra dev`.
+Runtime source/configuration must be clean; the script verifies the imported
+Python module paths. It neither switches branches nor installs environments.
+
+```bash
+python scripts/compare_afd_commits.py \
+  --before /absolute/path/to/before-checkout \
+  --after /absolute/path/to/after-checkout \
+  --systems-path /absolute/path/to/shared/systems \
+  --output /absolute/path/to/new-comparison-directory
+```
+
+`--systems-path` is the directory containing `h200_sxm.yaml` and `data/`.
+Use a version-controlled, unchanged directory for both runs. Without this option,
+each checkout uses its bundled systems. The default gate rejects different model
+or H200 input fingerprints. `--allow-input-drift` explicitly selects a combined
+code-and-data comparison, which must not be interpreted as isolated code impact.
+Separate Python executables can be selected with `--before-python` and
+`--after-python`; otherwise each checkout's project venv is used. Interpreter
+versions and installed package versions are recorded, but dependency equality is
+not enforced: attribution to code alone requires reviewing those records too.
+
+The paired gate checks all 28 resolved queries, required metrics, positive finite
+latencies, phase/path metadata and rejection type/message pattern/origin on BOTH
+sides. It compares the two executions directly; it does not compare each side to
+a regenerated golden file. Fixed-target verification remains the separate pytest
+suite above. The default relative tolerance is zero; any numerical change fails,
+including faster results. `--relative-tolerance` is a fractional absolute relative
+change bound (e.g. `0.01` = 1%) chosen before a run and recorded in its report.
+
+Every output directory must be new. Outputs are `before.json`, `after.json`, both
+execution logs, `comparison.json`, and `report.md` with per-metric before/after,
+signed millisecond delta and percentage delta. Commit IDs, input hashes, query
+coverage and harness/manifest hashes are retained. Execution/setup failures write
+`failure.json` and return nonzero; completed comparisons return 0 for pass or 2
+for gate failure. Failures are never dropped from the denominator.
+
+The comparator has 17 additional guard tests in
+`tests/test_afd_commit_comparison.py`; these are harness tests, not extra workload
+cases. Pair execution is an explicit command, not an automatic CI job comparing
+arbitrary commits. Existing CI can collect the 29 fixed-baseline tests and the 17
+harness tests.
+
+### Verified run (2026-10-01)
+
+Compared `36b5465faf9aa383223533580006f1e387225c45` against
+`6916579586561f22fbde2f70a7f3d395c2ec5a96` using the latter checkout's
+H200 systems directory for both executions: 28/28 cases passed, all 24 numerical
+comparisons had zero delta, and all seven expected rejections matched.
+Python was 3.13.7 on both sides. Environment differences were AISimulate
+0.12.0/0.13.0, googleapis-common-protos 1.75.1/1.75.3, and ijson absent/3.5.1;
+this establishes observed agreement for these environments, not isolated causal
+attribution to source changes. Using each checkout's own bundled database was
+correctly rejected by the default input-equality gate (exit 2).
+
+The fixed-baseline and harness tests together passed 44/44 in 3.04 seconds
+(28 workloads + one integrity check + 15 comparator guard tests).
