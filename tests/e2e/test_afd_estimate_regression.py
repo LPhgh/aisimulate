@@ -48,17 +48,35 @@ _EXPECTED_CASE_IDS = {
     "invalid-missing-ffn-nodes",
     "invalid-zero-microbatches",
     "invalid-zero-attention-tp",
+    "invalid-ffn-ep-not-divisor",
+    "invalid-zero-attention-nodes",
+    "invalid-zero-a-batch-size",
+    "invalid-zero-comm-overhead",
+    "invalid-attention-tp-not-divisor",
+    "invalid-oom",
 }
+# Rejections the manifest is allowed to pin. Keeping this explicit means an unusable ``type``
+# fails the manifest integrity test instead of surfacing as a KeyError mid-case.
+_ERROR_TYPES = {"ValueError": ValueError, "NotImplementedError": NotImplementedError, "RuntimeError": RuntimeError}
+# Overrides that only the static complement of a combined AFD+PD query consumes, and that the
+# common query therefore does not list.
+_STATIC_COMPLEMENT_OVERRIDE_KEYS = {"tp_size", "moe_tp_size", "moe_ep_size"}
 
 
 def test_baseline_manifest_is_complete():
     cases = _BASELINE["cases"]
     assert len(cases) == len(_EXPECTED_CASE_IDS)
     assert {case["id"] for case in cases} == _EXPECTED_CASE_IDS
+    allowed_overrides = set(_BASELINE["query"]) | _STATIC_COMPLEMENT_OVERRIDE_KEYS
     for case in cases:
+        # A typo'd override key would otherwise reach cli_estimate and fail as a distant TypeError.
+        assert isinstance(case["overrides"], dict), case["id"]
+        unexpected = sorted(set(case["overrides"]) - allowed_overrides)
+        assert not unexpected, (case["id"], unexpected)
         if case["id"].startswith("invalid-"):
             assert set(case["error"]) == {"type", "match", "origin"}
             assert all(case["error"].values())
+            assert case["error"]["type"] in _ERROR_TYPES, case["id"]
             assert "metrics" not in case
         else:
             assert "error" not in case
@@ -99,9 +117,11 @@ def test_afd_estimate_matches_frozen_target(case, frozen_inputs, tmp_path, caplo
     try:
         if "error" in case:
             expected = case["error"]
-            assert expected["type"] == "ValueError"
-            with pytest.raises(ValueError, match=expected["match"]) as caught:
+            with pytest.raises(_ERROR_TYPES[expected["type"]], match=expected["match"]) as caught:
                 cli_estimate(**query)
+            # Pin the concrete class: pytest.raises accepts subclasses too, and AFDPartitionError is
+            # a ValueError that must not silently satisfy a plain-ValueError expectation.
+            assert type(caught.value).__name__ == expected["type"]
             origin = traceback.extract_tb(caught.value.__traceback__)[-1]
             evidence["error"] = {
                 "type": type(caught.value).__name__,
@@ -143,3 +163,19 @@ def test_afd_estimate_matches_frozen_target(case, frozen_inputs, tmp_path, caplo
     finally:
         evidence["logs"] = caplog.text
         (tmp_path / f"{case['id']}.json").write_text(json.dumps(evidence, indent=2) + "\n")
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="AFD+MTP silently drops afd_layer_measurements: the decode/static projection rebuilds the "
+    "result dict from a ColumnsAFD frame that omits the key. See tests/test_afd_projection_contract.py.",
+)
+def test_afd_mtp_preserves_layer_measurements(frozen_inputs):
+    """Strict xfail, so an XPASS means the defect is fixed: retire this test and the canary together.
+
+    Kept out of the frozen matrix on purpose. It pins no latency target, and adding it as a case
+    would bless the current lossy behaviour as expected.
+    """
+    query = {**_BASELINE["query"], "afd_phase": "decode", "nextn": 1, "nextn_accepted": 1.0}
+    result = cli_estimate(**query)
+    assert "afd_layer_measurements" in result.raw

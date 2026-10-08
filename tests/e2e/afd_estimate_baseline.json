@@ -786,6 +786,78 @@
         "origin": "__post_init__"
       },
       "target_commit": "6916579586561f22fbde2f70a7f3d395c2ec5a96"
+    },
+    {
+      "id": "invalid-ffn-ep-not-divisor",
+      "overrides": {
+        "f_moe_ep_size": 3
+      },
+      "error": {
+        "type": "ValueError",
+        "match": "f_moe_ep_size \\(3\\) must be a positive divisor of f_tp_size \\(8\\)",
+        "origin": "_run_afd_estimate"
+      },
+      "target_commit": "6d7b0e5329b221eb95465d7b4593919ad2e92f4b"
+    },
+    {
+      "id": "invalid-zero-attention-nodes",
+      "overrides": {
+        "n_a_nodes": 0
+      },
+      "error": {
+        "type": "ValueError",
+        "match": "n_a_nodes \\(0\\) and n_f_nodes \\(1\\) must both be >= 1",
+        "origin": "__post_init__"
+      },
+      "target_commit": "6d7b0e5329b221eb95465d7b4593919ad2e92f4b"
+    },
+    {
+      "id": "invalid-zero-a-batch-size",
+      "overrides": {
+        "a_batch_size": 0
+      },
+      "error": {
+        "type": "ValueError",
+        "match": "a_batch_size \\(0\\) must be >= 1",
+        "origin": "__post_init__"
+      },
+      "target_commit": "6d7b0e5329b221eb95465d7b4593919ad2e92f4b"
+    },
+    {
+      "id": "invalid-zero-comm-overhead",
+      "overrides": {
+        "comm_overhead_factor": 0
+      },
+      "error": {
+        "type": "ValueError",
+        "match": "comm_overhead_factor \\(0\\) must be > 0",
+        "origin": "__post_init__"
+      },
+      "target_commit": "6d7b0e5329b221eb95465d7b4593919ad2e92f4b"
+    },
+    {
+      "id": "invalid-attention-tp-not-divisor",
+      "overrides": {
+        "a_tp_size": 3
+      },
+      "error": {
+        "type": "ValueError",
+        "match": "tp_a \\(3\\) must be a positive divisor of gpus_per_node \\(8\\)",
+        "origin": "__post_init__"
+      },
+      "target_commit": "6d7b0e5329b221eb95465d7b4593919ad2e92f4b"
+    },
+    {
+      "id": "invalid-oom",
+      "overrides": {
+        "isl": 1000000
+      },
+      "error": {
+        "type": "RuntimeError",
+        "match": "OOM: the model .* does not fit in GPU memory",
+        "origin": "_run_afd_estimate"
+      },
+      "target_commit": "6d7b0e5329b221eb95465d7b4593919ad2e92f4b"
     }
   ],
   "input_commit": "cab77b9c7888b1c40df8cd3228f5e03c355ef23c"
