@@ -31,17 +31,60 @@ def git(repo, *args):
 
 
 def validate_manifest(manifest):
+    if not isinstance(manifest.get("query"), dict) or not manifest["query"]:
+        raise ValueError("Case manifest must define a nonempty common 'query' object")
+    if not isinstance(manifest.get("input_sha256"), dict) or not manifest["input_sha256"]:
+        raise ValueError("Case manifest must define a nonempty 'input_sha256' fingerprint map")
     cases = manifest["cases"]
     ids = [case["id"] for case in cases]
     if not ids or len(set(ids)) != len(ids):
         raise ValueError("Case manifest must be nonempty with unique IDs")
     for case in cases:
+        if not isinstance(case.get("overrides"), dict):
+            raise ValueError(f"{case['id']}: manifest case missing ['overrides']")
         if "error" in case:
             required = {"type", "match", "origin"} - case["error"].keys()
         else:
+            # ``metrics`` has two roles: the frozen golden value asserted by the pytest suite, and
+            # the optional absolute anchor for --check-targets. Without that flag ``compare`` only
+            # pairs the two sides against each other.
             required = {"metrics", "path", "phases"} - case.keys()
         if required:
             raise ValueError(f"{case['id']}: manifest case missing {sorted(required)}")
+
+
+def input_drift(snapshot, manifest):
+    """Diff one snapshot's fingerprints against the manifest baseline.
+
+    Catching files that vanished from disk matters as much as changed hashes: a snapshot rebuilt
+    by walking the systems directory simply omits absent files, so both sides can agree on a
+    database that no longer matches the baseline.
+    """
+    expected = manifest["input_sha256"]
+    actual = snapshot.get("input_sha256", {})
+    return {
+        "missing": sorted(set(expected) - set(actual)),
+        "extra": sorted(set(actual) - set(expected)),
+        "changed": sorted(key for key in set(expected) & set(actual) if expected[key] != actual[key]),
+    }
+
+
+def environment_diff(before, after):
+    """Reported for attribution only; dependency equality is deliberately not gated."""
+    left, right = before.get("packages", {}), after.get("packages", {})
+    diff = {
+        "added": {name: right[name] for name in sorted(set(right) - set(left))},
+        "removed": {name: left[name] for name in sorted(set(left) - set(right))},
+        "changed": {
+            name: {"before": left[name], "after": right[name]}
+            for name in sorted(set(left) & set(right))
+            if left[name] != right[name]
+        },
+    }
+    for key in ("python", "executable"):
+        if before.get(key) != after.get(key):
+            diff[key] = {"before": before.get(key), "after": after.get(key)}
+    return diff
 
 
 def capture(repo, manifest, systems_path):
@@ -115,25 +158,43 @@ def capture(repo, manifest, systems_path):
     }
 
 
-def compare(before, after, manifest, tolerance, allow_input_drift=False):
+def compare(before, after, manifest, tolerance, allow_input_drift=False, check_targets=False):
     validate_manifest(manifest)
     failures = []
     deltas = []
+    target_deviations = []
     expected_ids = [case["id"] for case in manifest["cases"]]
     inputs_equal = before["input_sha256"] == after["input_sha256"]
     if not inputs_equal and not allow_input_drift:
         failures.append("Input fingerprints differ: use common --systems-path for paired code regression")
+    drift = {label: input_drift(snapshot, manifest) for label, snapshot in (("before", before), ("after", after))}
+    inputs_match_manifest = not any(any(delta.values()) for delta in drift.values())
+    if not inputs_match_manifest and not allow_input_drift:
+        for label, delta in drift.items():
+            if any(delta.values()):
+                failures.append(
+                    f"{label}: inputs differ from manifest baseline ({len(delta['missing'])} missing, "
+                    f"{len(delta['extra'])} extra, {len(delta['changed'])} changed)"
+                )
+    structural_failure = False
     for label, snapshot in (("before", before), ("after", after)):
         if [row["id"] for row in snapshot["cases"]] != expected_ids:
             failures.append(f"{label}: missing, duplicate, reordered or unexpected cases")
-    if failures and any("cases" in item for item in failures):
-        return {
-            "passed": False,
-            "failures": failures,
-            "deltas": [],
-            "inputs_equal": inputs_equal,
-            "comparison_kind": "paired-code" if inputs_equal else "code-and-data",
-        }
+            structural_failure = True
+    common = {
+        "inputs_equal": inputs_equal,
+        "inputs_match_manifest": inputs_match_manifest,
+        "input_drift": drift,
+        # Both gates define "paired code": agreeing with each other is not enough if the shared
+        # inputs are not the baseline's, otherwise the label advertises an isolation it lacks.
+        "comparison_kind": "paired-code" if inputs_equal and inputs_match_manifest else "code-and-data",
+        "check_targets": check_targets,
+        "environment_diff": environment_diff(before, after),
+    }
+    # An explicit flag, not a substring of the failure text: the zip below is strict, so a case
+    # count mismatch has to short-circuit or it raises instead of reporting.
+    if structural_failure:
+        return {"passed": False, "failures": failures, "deltas": [], "target_deviations": [], **common}
     for case, old, new in zip(manifest["cases"], before["cases"], after["cases"], strict=True):
         name = case["id"]
         expected_query = {**manifest["query"], **case["overrides"]}
@@ -172,6 +233,7 @@ def compare(before, after, manifest, tolerance, allow_input_drift=False):
             if not all(isinstance(v, (int, float)) and math.isfinite(v) and v > 0 for v in (left, right)):
                 failures.append(f"{name}/{metric}: missing or invalid latency")
                 continue
+            # Single-sided relative change, so a 0.01 bound admits +1% but also -0.99%.
             relative = (right - left) / left
             deltas.append(
                 {
@@ -185,13 +247,94 @@ def compare(before, after, manifest, tolerance, allow_input_drift=False):
             )
             if abs(relative) > tolerance:
                 failures.append(f"{name}/{metric}: relative drift {relative:.9g} exceeds {tolerance}")
+            target = case["metrics"].get(metric)
+            if isinstance(target, (int, float)) and math.isfinite(target) and target > 0:
+                for label, value in (("before", left), ("after", right)):
+                    deviation = (value - target) / target
+                    target_deviations.append(
+                        {
+                            "id": name,
+                            "metric": metric,
+                            "side": label,
+                            "target": target,
+                            "actual": value,
+                            "relative_deviation": deviation,
+                        }
+                    )
+                    if check_targets and abs(deviation) > tolerance:
+                        failures.append(
+                            f"{name}/{metric}/{label}: deviation from frozen target {deviation:.9g} exceeds {tolerance}"
+                        )
     return {
         "passed": not failures,
-        "inputs_equal": inputs_equal,
-        "comparison_kind": "paired-code" if inputs_equal else "code-and-data",
         "failures": failures,
         "deltas": deltas,
+        "target_deviations": target_deviations,
+        **common,
     }
+
+
+def _percent(value):
+    return "n/a" if value is None else f"{value * 100:.6f}"
+
+
+def _drift_lines(drift, limit=20):
+    lines = []
+    for label, delta in drift.items():
+        for kind in ("missing", "extra", "changed"):
+            keys = delta[kind]
+            if not keys:
+                continue
+            lines.append(f"- {label}: {len(keys)} {kind} input(s)")
+            lines += [f"  - `{key}`" for key in keys[:limit]]
+            if len(keys) > limit:
+                lines.append(f"  - ... and {len(keys) - limit} more (full list in comparison.json)")
+    return lines
+
+
+def render_report(result):
+    anchor = "frozen targets (--check-targets)" if result["check_targets"] else "none, paired sides only"
+    deviations = {
+        (row["id"], row["metric"], row["side"]): row["relative_deviation"] for row in result["target_deviations"]
+    }
+    lines = [
+        f"# AFD commit comparison: {'PASS' if result['passed'] else 'FAIL'}",
+        "",
+        f"Before: `{result['before_commit']}`",
+        f"After: `{result['after_commit']}`",
+        f"Cases: {result['case_count']}; kind: {result['comparison_kind']}; "
+        f"relative tolerance: {result['relative_tolerance']}",
+        f"Absolute anchor: {anchor}",
+        f"Inputs match manifest baseline: {result['inputs_match_manifest']}",
+        "",
+        "| Case | Metric | Before ms | After ms | Delta ms | Delta % | Before vs Target % | After vs Target % |",
+        "|---|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for row in result["deltas"]:
+        key = (row["id"], row["metric"])
+        lines.append(
+            f"| {row['id']} | {row['metric']} | {row['before']} | {row['after']} | "
+            f"{row['delta_ms']:.6f} | {row['relative_delta'] * 100:.6f} | "
+            f"{_percent(deviations.get((*key, 'before')))} | {_percent(deviations.get((*key, 'after')))} |"
+        )
+    drift_lines = _drift_lines(result["input_drift"])
+    if drift_lines:
+        lines += ["", "## Input fingerprint drift", *drift_lines]
+    environment = result["environment_diff"]
+    environment_lines = [f"- added `{name}` {version}" for name, version in environment["added"].items()]
+    environment_lines += [f"- removed `{name}` {version}" for name, version in environment["removed"].items()]
+    environment_lines += [
+        f"- changed `{name}` {versions['before']} -> {versions['after']}"
+        for name, versions in environment["changed"].items()
+    ]
+    environment_lines += [
+        f"- {key}: `{environment[key]['before']}` -> `{environment[key]['after']}`"
+        for key in ("python", "executable")
+        if key in environment
+    ]
+    lines += ["", "## Environment differences (reported, not gated)", *(environment_lines or ["- none"])]
+    lines += ["", "## Failures", *([f"- {item}" for item in result["failures"]] or ["- none"])]
+    return "\n".join(lines) + "\n"
 
 
 def main():
@@ -210,6 +353,11 @@ def main():
     parser.add_argument("--relative-tolerance", type=float, default=0.0)
     parser.add_argument(
         "--allow-input-drift", action="store_true", help="Explicit code-and-data comparison, not paired code regression"
+    )
+    parser.add_argument(
+        "--check-targets",
+        action="store_true",
+        help="Also gate each side against the manifest's frozen targets, not just against each other",
     )
     parser.add_argument("--capture", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -248,7 +396,7 @@ def main():
                     command, cwd=repo, env=env, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=600
                 )
             snapshots.append(json.loads(output.read_text()))
-        result = compare(*snapshots, manifest, args.relative_tolerance, args.allow_input_drift)
+        result = compare(*snapshots, manifest, args.relative_tolerance, args.allow_input_drift, args.check_targets)
         result.update(
             before_commit=snapshots[0]["commit"],
             after_commit=snapshots[1]["commit"],
@@ -258,27 +406,21 @@ def main():
             case_count=len(manifest["cases"]),
         )
         (args.output / "comparison.json").write_text(json.dumps(result, indent=2) + "\n")
-        lines = [
-            f"# AFD commit comparison: {'PASS' if result['passed'] else 'FAIL'}",
-            "",
-            f"Before: `{result['before_commit']}`",
-            f"After: `{result['after_commit']}`",
-            f"Cases: {result['case_count']}; kind: {result['comparison_kind']}; "
-            f"relative tolerance: {args.relative_tolerance}",
-            "",
-            "| Case | Metric | Before ms | After ms | Delta ms | Delta % |",
-            "|---|---|---:|---:|---:|---:|",
-        ]
-        for row in result["deltas"]:
-            lines.append(
-                f"| {row['id']} | {row['metric']} | {row['before']} | {row['after']} | "
-                f"{row['delta_ms']:.6f} | {row['relative_delta'] * 100:.6f} |"
-            )
-        lines += ["", *[f"- {failure}" for failure in result["failures"]]]
-        (args.output / "report.md").write_text("\n".join(lines) + "\n")
+        (args.output / "report.md").write_text(render_report(result))
         print(
             json.dumps(
-                {key: result[key] for key in ("passed", "case_count", "inputs_equal", "comparison_kind", "failures")}
+                {
+                    key: result[key]
+                    for key in (
+                        "passed",
+                        "case_count",
+                        "inputs_equal",
+                        "inputs_match_manifest",
+                        "comparison_kind",
+                        "check_targets",
+                        "failures",
+                    )
+                }
             )
         )
         return 0 if result["passed"] else 2
