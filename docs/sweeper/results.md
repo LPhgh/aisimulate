@@ -163,7 +163,7 @@ format: an empty CSV has only its header and therefore cannot carry run provenan
 
 ## Legacy AIC mapping
 
-The legacy AIC `ColumnsAgg`, `ColumnsDisagg`, `ColumnsAggEpd`, and `ColumnsAFD` DataFrame rows map to
+The legacy AIC `ColumnsAgg`, `ColumnsDisagg`, and `ColumnsAggEpd` DataFrame rows map to
 candidate records as follows. Parenthesized role prefixes become explicit prefill/decode/encoder or
 attention/FFN keys in `provenance.topology` and `config`; they are not retained as punctuation-based
 field names.

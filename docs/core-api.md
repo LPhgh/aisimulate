@@ -204,7 +204,7 @@ model = RustForwardPassPerfModel.best_available(config)
 
 The parquet identity must match the requested model, hardware, backend version, topology, and quantization. The systems YAML is still required, but a backend timing-data directory is unnecessary. Relative paths bind to the working directory when the model is constructed; resolved provenance stores the absolute path. The control applies when FPM interpolation is selected; other estimators retain it in provenance without opening the file. Saved legacy `timing.forward_model: fpm` and `timing.fpm_parquet_path` inputs migrate to the same canonical control, which is preserved in replay and per-role recommendation output.
 
-`model.static_phase_latency(batch_size=1, input_tokens=512, output_tokens=4, prefill=False)` exposes the native engine's existing static integration before online correction. Prefill returns one prefill latency; decode returns total decode latency for the output sequence. This method requires a native estimator. AFD+PD uses it for an external-FPM regular companion, dividing total decode latency by `max(1, output_tokens - 1)` for TPOT. AFD attention and FFN workers retain their existing timing provider.
+`model.static_phase_latency(batch_size=1, input_tokens=512, output_tokens=4, prefill=False)` exposes the native engine's existing static integration before online correction. Prefill returns one prefill latency; decode returns total decode latency for the output sequence. This method requires a native estimator. On the current AFD path the A/F pools are priced by the `aic-afd` timing provider; an afd+pd companion pool is monolithic and priced by the standard `aic` provider, never an external FPM.
 
 ### Engine identity controls
 
@@ -214,7 +214,8 @@ The canonical configuration also carries quantization overrides and `attention_b
 
 An explicit source is rejected for dense graphs, MegaMoE modules, large-EP expert-compute graphs, and any constructed timing phase with no compatible fused MoE operator. It is also incompatible with whole-forward FPM, including the legacy Task `forward_model='fpm'` rewrite. Invalid graph/source combinations fail as invalid configuration rather than triggering estimator fallback. An untrained `fpm_regression` model remains not-ready; retaining a source in its configuration is not evidence of source-specific prediction support.
 
-AFD regular companions currently reject exact-source requests through their legacy estimator and fixed timing paths. The external-FPM companion forwards the source to canonical validation, which rejects the incompatible FPM request. These controls describe standalone AISimulate behavior, not downstream Dynamo planner integration.
+The A/F pools forward the caller's estimator configuration to the `aic-afd` provider unchanged.
+These controls describe standalone AISimulate behavior, not downstream Dynamo planner integration.
 
 Rust callers using exhaustive `ForwardPassPerfModelConfig` literals must add `moe_backend: None`, `moe_kernel_source: None`, `enable_eplb: false`, and `wideep_num_slots: None`. Direct `EngineConfig` and `MoeOp` literals likewise require the new `moe_kernel_source` field. `ForwardPassPerfModelConfig::new(...)` supplies its default. This extends the canonical configuration introduced by #242.
 

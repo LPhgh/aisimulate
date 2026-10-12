@@ -718,7 +718,7 @@ aggregated candidates use the fallback.
 AIC's capacity sweep. P/D still shares one model, backend, and backend version. When a role hardware override
 is present and `backend_version` is omitted, both effective SKUs must resolve to the same
 latest version; otherwise set a common supported version explicitly, as above. Hardware
-overrides are rejected on aggregated workers and AFD companions. The separate analytical
+overrides are rejected on aggregated workers. The separate analytical
 EPD encoder hardware setting is unchanged.
 
 The Sweeper SDK also retains `search_space.prefill_hardware_sku` and
@@ -785,15 +785,21 @@ aisimulate predict --config ./afd-search/recommendations/0001.yaml --output-dir 
 inputs and GPU accounting.
 
 **What changed:** AFD has no compatibility command left to translate from; the unified CLI is its
-only entry point. `engine.afd` makes the decode-side AFD and prefill-companion topology explicit.
-The GPU budget includes attention, FFN, and companion pools. The search uses an explicit request
+only entry point. `engine.afd` makes the AFD pool topology explicit: `phase: both` with
+`combined_with_pd: false` for a pure pool, or a single `phase` with `combined_with_pd: true` for
+afd+pd — the AFD pool then serves one disagg role and a monolithic companion
+(`engine.workers.<opposite phase>`) serves the other on the generic two-pool handoff surface.
+AFD runs on the continuous SGLang scheduling core with the `aic-afd` timing provider injected,
+so `backend: sglang` is required (scheduling and perf data share the sglang family). The GPU
+budget includes the attention and FFN pools. The search uses an explicit request
 rate and throughput/GPU objective. The removed AIC search capped attention batch size at 128 and
 explicitly truncated enumeration to 32 topologies; the AISimulate YAML fixes attention batch size
 at 128. These searches do not cover identical operating points. Native
-AFD deployment generation remains unavailable. Use fixed-length synthetic traffic with an
-absolute load; see [AFD topology and limits](../sweeper/afd-topology.md). The AFD modeling engine is
-unchanged: `AFDInferenceSession`, `AFDConfig`, and the `aisimulate/sweeper/afd_*` modules still back
-both commands above.
+AFD deployment generation remains unavailable. Traffic may be synthetic (fixed or
+`random_range_ratio < 1.0`), trace, or prefix-cached, but the load must be absolute;
+see [AFD topology and limits](../sweeper/afd-topology.md). The analytical model
+lives in the Rust core (`crates/core/src/perfmodel/afd/`); the retired Python island
+(`AFDInferenceSession`, `afd_partition`, `afd_transfer`) no longer exists.
 
 ### 4.10 Inspect prediction details
 
@@ -1612,7 +1618,7 @@ feature's restrictions before migrating:
 | Feature | Current AISimulate boundary |
 |---|---|
 | [Analytical EPD](#predict-and-search-analytical-epd) | Fixed synthetic images and concurrency; no event-level encoder queueing or embedding transfer. |
-| [AFD](#afd-translation) | Unified CLI only; the compatibility CLI no longer offers AFD. Analytical fixed-length synthetic traffic; no native AFD deployment generation. |
+| [AFD](#afd-translation) | Unified CLI only; the compatibility CLI no longer offers AFD. Analytical, `backend: sglang`; pure `phase: both` pool or two-pool `afd+pd` (single-phase AFD pool plus a monolithic companion); no native AFD deployment generation. |
 | [Heterogeneous P/D hardware](#migrate-heterogeneous-pd-hardware-with-sweeper) | Unified `predict` / `recommend` and Sweeper; P/D roles can override hardware but share one model, backend, and backend version. |
 | [Native host offload](#model-cache-capacity-and-host-offload) | Aggregated vLLM with attention DP=1 and prefix caching; recommendation requires `preset: false` and fixed `attention_data: 1`, while other supported parallelism fields may be searched. |
 

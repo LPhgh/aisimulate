@@ -994,7 +994,8 @@ engine:
 ### 12.1 Engine Fields
 
 `<role>` is `aggregated`, `prefill`, or `decode` as selected by `engine.mode`. AFD uses
-`engine.afd` for its A/F pool and an optional opposite-phase regular worker.
+`engine.afd` for its A/F pool, requires `backend: sglang`, and declares no regular
+language-worker roles.
 
 | Knob | Default | Default Range | Preset | Rules |
 |---|---:|---|---|---|
@@ -1005,8 +1006,8 @@ engine:
 | `engine.backend_version` | `null` | `x` | `-` | Fixed when set. |
 | `engine.speculation` | Omitted (disabled) | `x` | `-` | Optional ngram draft count, conditional acceptance rates, and sampling seed; see [prompt lookup](#prompt-lookup-ngram-speculative-decoding). |
 | `engine.context_length` | `"max"` | `x` | `-` | `"max"` derives the effective maximum from the resolved Hugging Face model config; a concrete value must be positive. |
-| `engine.workers` | Mode-dependent | `x` | `-` | Aggregated role; prefill plus decode roles; or the optional opposite-phase companion for AFD+P/D. Aggregated and disaggregated modes also support an optional analytical `encoder` pool. |
-| `engine.workers.prefill.hardware`, `.decode.hardware` | Inherit `engine.hardware` | `x` | `-` | Concrete nonempty SKU; no `auto` or search domain. Disaggregated roles only; aggregated workers and AFD companions reject hardware overrides. Saved recommendations retain the overrides. |
+| `engine.workers` | Mode-dependent | `x` | `-` | Aggregated role; prefill plus decode roles. Aggregated and disaggregated modes also support an optional analytical `encoder` pool. |
+| `engine.workers.prefill.hardware`, `.decode.hardware` | Inherit `engine.hardware` | `x` | `-` | Concrete nonempty SKU; no `auto` or search domain. Disaggregated roles only; aggregated workers reject hardware overrides. Saved recommendations retain the overrides. |
 | `engine.workers.encoder.tensor`, `.replicas`, `.batch_size` | `1` | Scalar or finite `choices` | `encoder` | Positive; batch size at most 8. Not a language-worker parallelism preset. |
 | `engine.workers.encoder.hardware`, `.backend_version` | Inherit/resolve | `x` | `-` | Encoder hardware and performance data; backend follows language backend. Saved prediction YAML pins resolved values. |
 | `engine.workers.encoder.latency_correction`, `.rate_degradation` | `1.0`, `0.9` | `x` | `-` | Finite positive factors; degradation at most 1. See [EPD CLI semantics](../sweeper/epd.md#unified-cli). |
@@ -1037,18 +1038,20 @@ engine:
 | `engine.workers.<role>.timing.prefill_ms` | `null` | `x` | `-` | Nonnegative and required for `fixed` timing. |
 | `engine.workers.<role>.timing.decode_ms` | `null` | `x` | `-` | Nonnegative and required for `fixed` timing. |
 | `engine.workers.<role>.timing.forward_model` | `op_level` | `x` | `-` | `op_level` or `fpm`; `default` timing only. `fpm` replays whole-forward (FPM) latency measured for the role's exact model, hardware, backend version, parallel shape and quantization, and fails closed when no such cell exists. |
-| `engine.workers.<role>.timing.fpm_parquet_path` | `null` | `x` | `-` | External FPM parquet for `forward_model: fpm`; the adjacent same-stem `.metadata.json` sidecar is required. Relative paths are anchored to the working directory when the engine is constructed. Preserved per role in recommendations, candidate YAML, and regular prefill/decode companions in AFD+PD. |
+| `engine.workers.<role>.timing.fpm_parquet_path` | `null` | `x` | `-` | External FPM parquet for `forward_model: fpm`; the adjacent same-stem `.metadata.json` sidecar is required. Relative paths are anchored to the working directory when the engine is constructed. Preserved per role in recommendations and candidate YAML. |
 | `engine.workers.<role>.startup_seconds` | `0` | `x` | `-` | Nonnegative. |
 | `engine.kv_transfer.bytes_per_token` | `auto` | `x` | `-` | Positive when concrete. Independent from worker KV-cache geometry; `auto` resolves from the prefill/source role's TP/PP/MoE shape. |
 | `engine.kv_transfer.bandwidth_gb_per_second` | `null` | `x` | `-` | Positive when set; `null` disables transfer delay. |
 | `engine.kv_transfer.timing_mode` | `destination_missing` | `x` | `-` | `full_prompt` or `destination_missing`; disaggregated mode only. |
-| `engine.afd.phase` | Required for AFD | `x` | `-` | `both` for pure AFD; `prefill` or `decode` when `combined_with_pd: true`. |
-| `engine.afd.combined_with_pd` | Required for AFD | `x` | `-` | Selects pure `afd` or internal `afd+pd`; it is never inferred from workers. |
+| `engine.afd.phase` | Required for AFD | `x` | `-` | `both` for a pure pool; `prefill` / `decode` assign the pool one role of the two-pool `afd+pd` form. |
+| `engine.afd.combined_with_pd` | Required for AFD | `x` | `-` | `false` for a pure pool; `true` pairs the single-phase AFD pool with a monolithic companion (`workers.<opposite phase>`) on the generic disagg handoff surface. |
 | `engine.afd.a_batch_size` | Required for AFD | User-supplied finite domain | `-` | Positive, memory-qualified A-worker batch size. Prediction requires one value. |
+| `engine.afd.chunked_prefill_size` | `null` | `-` | `-` | Prediction only. Positive; unset pins the prefill window at the prompt length (single-pass prefill). A smaller value enables SGLang native chunked prefill; each chunk pass is priced at its actual (chunk tokens, prefix) geometry. |
+| `engine.afd.pipeline_fill_mode` | `per_pass` | `-` | `-` | `per_pass` pays the pipeline fill on every pass (conservative); `amortized` prices steady-state decode passes at cycle terms only (fill charged at pipeline startup and on boundary passes). |
 | `engine.afd.n_a_nodes`, `n_f_nodes`, `tp_a` | Required for AFD prediction | Enumerated within the GPU budget | `-` | Positive concrete topology fields. Recommendation may optionally constrain `tp_a`. |
 | `engine.afd.f_moe_ep_size` | `1` for prediction; model-derived domain for recommendation | Optional choices | `-` | Positive; recommendation also accepts `n_f_nodes` or `ffn_tp`. Dense models require `1`. |
 | `engine.afd.num_microbatches` | `3` for prediction | `{choices: [2, 3, 4]}` | `-` | Positive. |
-| `engine.afd.pipeline_model` | `optimistic` for prediction | `{choices: [optimistic, conservative]}` | `-` | `optimistic`, `conservative`, or `serial`. |
+| `engine.afd.pipeline_model` | `full_overlap` for prediction | `{choices: [full_overlap, partial_overlap]}` | `-` | `no_overlap`, `partial_overlap`, or `full_overlap` (legacy aliases `serial`, `conservative`, `optimistic` still accepted). |
 | `engine.afd.comm_overhead_factor` | `1.0` | `x` | `-` | Positive factor applied once by the AFD evaluator. |
 | `engine.afd.boundary_on_attn` | `true` | `x` | `-` | Fixed A/F boundary convention. |
 
@@ -1110,13 +1113,15 @@ If `engine.mode` is a
 recommendation domain containing both modes, `workers` declares all three roles. Each concrete
 candidate retains only the role or roles active for its selected mode.
 
-An AFD prediction is concrete: pure AFD requires `phase: both` and explicit `n_a_nodes`,
-`n_f_nodes`, `tp_a`, and `a_batch_size`. A single-phase topology sets
-`combined_with_pd: true` and supplies only its opposite regular worker: a decode-side AFD pool uses
-`workers.prefill`, while a prefill-side AFD pool uses `workers.decode`. Recommendation enumerates
+An AFD prediction is concrete: it requires `phase: both`, `combined_with_pd: false`,
+`backend: sglang`, and explicit `n_a_nodes`, `n_f_nodes`, `tp_a`, and `a_batch_size`, and it
+rejects regular `workers` roles. Recommendation enumerates
 the node split under `optimization.constraints.max_candidate_gpus`; it still requires an explicit,
-memory-qualified `a_batch_size` domain. AFD supports fixed-length synthetic request traffic and an
-absolute load only. The implementation is an analytical foreground-engine execution path, not a
+memory-qualified `a_batch_size` domain. AFD requires an absolute load (not `kv_capacity_fraction`);
+synthetic, trace, and prefix-cached traffic are all accepted, and the decode pricing identity
+differs between them (see [AFD topology and limits](../sweeper/afd-topology.md#staged-evaluation)).
+The A/F pool runs on the SGLang continuous-batching core with the `aic-afd` timing provider
+injected, so it is an analytical execution path, not a
 claim that the selected topology was physically served.
 
 `kv_cache.capacity.type: default` and `timing.type: default` replace the previous public name `aic`.
@@ -1903,7 +1908,7 @@ unavailable; their summary fields are explicit nulls where unsupported.
   outcome. `execution-events.jsonl` retains complete checkpoints after interruption; see
   [local execution resources](../local-resources.md) for their interpretation.
 - `afd-replay-spec.json` is the exact, deterministic analytical replay contract for an AFD run,
-  including topology, measurement provenance, workload, goal, and any P/D companion.
+  including topology, measurement provenance, workload, and goal.
 - `afd-qualification.json` validates and summarizes the A/F pools, routing order, backend version,
   measurement coverage, and GPU accounting. It explicitly records that native launch generation is
   unsupported; it is not a Kubernetes manifest or runnable shell artifact.

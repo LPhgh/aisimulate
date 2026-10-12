@@ -145,7 +145,7 @@ search_space:
       a_batch_size: 64
       f_moe_ep_size: 1
       num_microbatches: 3
-      pipeline_model: optimistic
+      pipeline_model: full_overlap
 
 workload:
   isl: 1024
