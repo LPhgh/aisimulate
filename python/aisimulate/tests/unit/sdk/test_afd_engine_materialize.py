@@ -16,7 +16,6 @@ phase != both).
 from __future__ import annotations
 
 import dataclasses
-import math
 
 import pytest
 
@@ -161,7 +160,7 @@ def test_scheduler_derivation_for_synthetic_workload():
     engine = _materialize_afd_engine_role(spec.backend_deployment, spec)["rank"]
 
     assert engine["max_num_seqs"] == 18
-    assert engine["num_gpu_blocks"] == math.ceil(18 * (1024 + 128) * 1.25)
+    assert "num_gpu_blocks" not in engine
     assert engine["block_size"] == 1
     assert engine["max_model_len"] == 1024 + 128
     assert engine["sglang"] == {"chunked_prefill_size": 1024, "max_prefill_tokens": 1024}
@@ -173,7 +172,7 @@ def test_scheduler_derivation_uses_the_context_window_when_present():
     engine = _materialize_afd_engine_role(spec.backend_deployment, spec)["rank"]
 
     assert engine["max_num_seqs"] == 18
-    assert engine["num_gpu_blocks"] == math.ceil(18 * 8192 * 1.25)
+    assert "num_gpu_blocks" not in engine
     assert engine["block_size"] == 1
     assert engine["max_model_len"] == 8192
     assert engine["sglang"] == {"chunked_prefill_size": 8192, "max_prefill_tokens": 8192}
@@ -199,7 +198,7 @@ def test_variable_length_traffic_is_exempt_from_the_window_lower_bound():
     engine = _materialize_afd_engine_role(spec.backend_deployment, spec)["rank"]
 
     assert engine["max_model_len"] == 512
-    assert engine["num_gpu_blocks"] == math.ceil(18 * 512 * 1.25)
+    assert "num_gpu_blocks" not in engine
 
 
 def test_afd_capability_surface_is_exactly_sglang_pure_afd():
@@ -219,7 +218,7 @@ def test_trace_workload_without_context_length_reserves_the_model_window(monkeyp
     engine = _materialize_afd_engine_role(spec.backend_deployment, spec)["rank"]
 
     assert engine["timing_model"]["config"]["max_seq_len"] == 40960
-    assert engine["num_gpu_blocks"] == math.ceil(18 * 40960 * 1.25)
+    assert "num_gpu_blocks" not in engine
     assert engine["block_size"] == 1
     assert engine["max_model_len"] == 40960
 
@@ -265,7 +264,7 @@ def test_variable_length_synthetic_traffic_drops_the_frozen_decode_identity(monk
 
     assert engine["timing_model"]["config"]["frozen_decode_identity"] is False
     assert engine["timing_model"]["config"]["max_seq_len"] is None
-    assert engine["num_gpu_blocks"] == math.ceil(18 * (1024 + 128) * 1.25)
+    assert "num_gpu_blocks" not in engine
     assert engine["block_size"] == 1
     assert engine["max_model_len"] == 1024 + 128
 

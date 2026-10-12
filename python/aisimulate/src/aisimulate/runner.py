@@ -354,13 +354,6 @@ class EngineReplayRunner:
         """
 
 
-# Headroom for the derived SGLang KV capacity on the continuous AFD path:
-# covers SGLang's strict-fit admission comparison (charged >= remaining is
-# rejected) and the new_token_ratio output reservation, so a memory-qualified
-# AFD deployment admits up to max_num_seqs without routine retraction.
-_AFD_KV_CAPACITY_HEADROOM = 1.25
-
-
 def _materialize_afd_engine_role(
     deployment: BackendDeploymentSpec,
     spec: ReplaySpec,
@@ -509,11 +502,8 @@ def _materialize_afd_engine_role(
     # Continuous-batching scheduler derivation (SglangCore injection):
     # - max_num_seqs mirrors the pool's in-flight capacity
     #   (n_a_workers * a_batch_size, the timing provider's total_batch_size);
-    # - num_gpu_blocks is sized so the radix memory admission never binds
-    #   below max_num_seqs: the per-pool memory gate has already validated
-    #   physical fit, and runtime retraction is only an anomaly backstop.
-    #   The headroom covers SGLang's strict-fit admission comparison and the
-    #   new_token_ratio output reservation;
+    # - num_gpu_blocks is derived by the native provider from the per-pool
+    #   memory gate; runtime retraction reflects physical KV capacity;
     # - chunked_prefill_size / max_prefill_tokens are pinned at the prompt
     #   window so every prompt pre-fills in a single pass (the AFD timing
     #   identity charges one frozen prefill step per pass);
@@ -524,12 +514,10 @@ def _materialize_afd_engine_role(
     max_num_seqs = n_a_workers * a_pool["a_batch_size"]
     prompt_window = int(context_length or 0) or isl
     kv_window = int(context_length or 0) or (isl + osl)
-    num_gpu_blocks = math.ceil(max_num_seqs * kv_window * _AFD_KV_CAPACITY_HEADROOM / block_size)
     engine: dict[str, JSONValue] = {
         "backend": backend,
         "afd": afd_config,
         "max_num_seqs": max_num_seqs,
-        "num_gpu_blocks": num_gpu_blocks,
         "block_size": block_size,
         "max_model_len": kv_window,
         "sglang": {

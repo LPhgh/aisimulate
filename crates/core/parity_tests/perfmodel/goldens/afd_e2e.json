@@ -1,7 +1,7 @@
 {
  "cases": {
   "qwen3-32b-h200-sglang-pure-both": {
-   "attribution": "Continuous-batching rebuild: the AFD pool now runs on the SGLang continuous scheduler (mid-flight admission + retraction) with the aic-afd timing provider injected, anchoring the sglang perf-DB family (0.5.14); the retired batch-locked AfdCore + trtllm anchor is not comparable and was dropped (mean_ttft_ms 422.1866311464918 / mean_tpot_ms 11.846695674852583 at a_batch_size=18). The afd+pd cases (pd-decode / pd-prefill) are retired: two-pool handoff is fail-loud future work on the continuous path. One data caveat: the h200_sxm sglang family lacks mla_bmm rows, so that op family falls back to trtllm 1.3.0rc20 data (framework-implicit, warned at load).",
+   "attribution": "Continuous-batching rebuild: the AFD pool now runs on the SGLang continuous scheduler (mid-flight admission + retraction) with the aic-afd timing provider injected, anchoring the sglang perf-DB family (0.5.14); the retired batch-locked AfdCore + trtllm anchor is not comparable and was dropped (mean_ttft_ms 422.1866311464918 / mean_tpot_ms 11.846695674852583 at a_batch_size=18). The afd+pd cases (pd-decode / pd-prefill) run on the same continuous core with a monolithic companion. One data caveat: the h200_sxm sglang family lacks mla_bmm rows, so that op family falls back to trtllm 1.3.0rc20 data (framework-implicit, warned at load).",
    "config": "crates/core/parity_tests/perfmodel/configs/afd-predict-pure.yaml",
    "gate": "native",
    "summary": {

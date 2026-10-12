@@ -935,11 +935,10 @@ fn resolve_role_timing(
     if provider == "aic-afd" {
         // The AFD role's rank config carries the afd pool topology as pure
         // metadata; this branch materializes the per-pool timing model.
-        // KV capacity is NOT estimated here (the aic materialize/cap helpers
-        // are monolithic-only): the rank runs on the monolithic backend core
-        // with a capacity derived to keep max_num_seqs the binding admission
-        // limit, and physical feasibility is enforced by the per-pool memory
-        // gate below (runtime retraction is only an anomaly backstop).
+        // Physical feasibility is enforced by the per-pool memory gate below,
+        // and — unless the caller pinned num_gpu_blocks — the rank's KV
+        // capacity is derived from the gate's own A-pool budget so runtime
+        // retraction reflects physical OOM.
         let wire: AfdTimingConfig = serde_json::from_value(config)
             .context("invalid aic-afd timing provider configuration")?;
         // The timing config's nextn prices the verify width (cost side); the
@@ -959,7 +958,22 @@ fn resolve_role_timing(
             .context("invalid aic-afd timing provider configuration")?;
         let perf = AfdForwardPassPerfModel::build(perf_config)
             .context("failed to build the aic-afd per-pool perf model")?;
-        check_afd_memory_fit_py(&wire, &perf, role.rank.afd.as_ref())?;
+        let (kv_budget_bytes, kv_bytes_per_token) =
+            check_afd_memory_fit_and_kv_budget_py(&wire, &perf, role.rank.afd.as_ref())?;
+        if !capacity_is_explicit {
+            // Physical KV capacity: the A pool's per-GPU budget (the memory
+            // gate's own output) converted to tokens and summed across A
+            // workers. Retraction reflects physical OOM (the memory gate has
+            // already charged weights/activations/NCCL and the backend KV
+            // reserve).
+            role.rank.num_gpu_blocks = afd_derived_kv_blocks(
+                wire.a_pool.n_a_nodes,
+                wire.gpus_per_node,
+                wire.a_pool.tp_a,
+                kv_budget_bytes,
+                kv_bytes_per_token,
+            )?;
+        }
         return Ok(Some(Arc::new(AfdTimingModel::with_fill_mode(
             perf,
             isl,
@@ -1017,12 +1031,17 @@ fn resolve_role_timing(
 /// model computes activations/KV/NCCL/other per pool and the caller adds the
 /// Rust partition weight sums (`Op::weight_bytes`). Runs at provider
 /// construction so infeasible candidates fail at replay start.
+///
+/// On success also returns the A pool's `(kv_budget_bytes_per_gpu,
+/// kv_bytes_per_token_per_gpu)` from the same memory model, so the scheduler
+/// KV capacity is derived from physical memory (retraction reflects real
+/// OOM) rather than a sentinel headroom.
 #[cfg(feature = "python")]
-fn check_afd_memory_fit_py(
+fn check_afd_memory_fit_and_kv_budget_py(
     config: &AfdTimingConfig,
     perf: &AfdForwardPassPerfModel,
     afd: Option<&crate::engine::AfdEngineConfig>,
-) -> Result<()> {
+) -> Result<(f64, f64)> {
     use pyo3::types::PyDict;
     let phase = match afd.map(|afd| afd.phase) {
         Some(crate::engine::AfdPoolPhase::Prefill) => "prefill",
@@ -1031,27 +1050,21 @@ fn check_afd_memory_fit_py(
     };
     Python::with_gil(|py| {
         let module = py.import("aisimulate.sdk.afd_memory")?;
-        let kwargs = PyDict::new(py);
-        kwargs.set_item("model_path", &config.model)?;
-        kwargs.set_item("backend_name", config.backend.as_str())?;
-        kwargs.set_item("backend_version", config.backend_version.clone())?;
-        kwargs.set_item("isl", config.isl)?;
-        kwargs.set_item("osl", config.osl)?;
-        kwargs.set_item("prefix", 0)?;
-        kwargs.set_item("nextn", config.nextn)?;
+        let common = PyDict::new(py);
+        common.set_item("model_path", &config.model)?;
+        common.set_item("backend_name", config.backend.as_str())?;
+        common.set_item("backend_version", config.backend_version.clone())?;
+        common.set_item("isl", config.isl)?;
+        common.set_item("osl", config.osl)?;
+        common.set_item("prefix", 0)?;
         let a_pool = PyDict::new(py);
         a_pool.set_item("system", &config.a_pool.system)?;
         a_pool.set_item("tp_a", config.a_pool.tp_a)?;
         a_pool.set_item("n_a_nodes", config.a_pool.n_a_nodes)?;
-        kwargs.set_item("a_pool", a_pool)?;
-        let f_pool = PyDict::new(py);
-        f_pool.set_item("system", &config.f_pool.system)?;
-        f_pool.set_item("f_moe_ep_size", config.f_pool.f_moe_ep_size)?;
-        f_pool.set_item("n_f_nodes", config.f_pool.n_f_nodes)?;
-        kwargs.set_item("f_pool", f_pool)?;
-        kwargs.set_item("gpus_per_node", config.gpus_per_node)?;
-        kwargs.set_item("a_batch_size", config.a_pool.a_batch_size)?;
-        kwargs.set_item("num_microbatches", config.num_microbatches)?;
+        common.set_item("a_pool", a_pool)?;
+        common.set_item("gpus_per_node", config.gpus_per_node)?;
+        common.set_item("a_batch_size", config.a_pool.a_batch_size)?;
+        common.set_item("num_microbatches", config.num_microbatches)?;
         // Per-phase partition weights: each phase's memory dict sums that
         // phase's own op-list partition.
         let phase_weights = |a_pool_side: bool| -> std::result::Result<_, pyo3::PyErr> {
@@ -1072,16 +1085,57 @@ fn check_afd_memory_fit_py(
             )?;
             Ok(weights)
         };
-        kwargs.set_item("max_seq_len", config.max_seq_len)?;
-        kwargs.set_item("a_weight_gb", phase_weights(true)?)?;
-        kwargs.set_item("f_weight_gb", phase_weights(false)?)?;
-        kwargs.set_item("phase", phase)?;
+        common.set_item("max_seq_len", config.max_seq_len)?;
+        common.set_item("phase", phase)?;
+
+        let check_kwargs = common.call_method0("copy")?.downcast_into::<PyDict>()?;
+        check_kwargs.set_item("nextn", config.nextn)?;
+        let f_pool = PyDict::new(py);
+        f_pool.set_item("system", &config.f_pool.system)?;
+        f_pool.set_item("f_moe_ep_size", config.f_pool.f_moe_ep_size)?;
+        f_pool.set_item("n_f_nodes", config.f_pool.n_f_nodes)?;
+        check_kwargs.set_item("f_pool", f_pool)?;
+        check_kwargs.set_item("a_weight_gb", phase_weights(true)?)?;
+        check_kwargs.set_item("f_weight_gb", phase_weights(false)?)?;
         module
             .getattr("check_afd_memory_fit")?
-            .call((), Some(&kwargs))?;
-        Ok::<_, pyo3::PyErr>(())
+            .call((), Some(&check_kwargs))?;
+
+        let estimate_kwargs = common.call_method0("copy")?.downcast_into::<PyDict>()?;
+        estimate_kwargs.set_item("a_weight_gb", phase_weights(true)?)?;
+        let budget: (f64, f64) = module
+            .getattr("estimate_afd_kv_budget_bytes")?
+            .call((), Some(&estimate_kwargs))?
+            .extract()?;
+        Ok::<_, pyo3::PyErr>(budget)
     })
     .map_err(|error| anyhow::anyhow!("AFD memory-feasibility check failed: {error}"))
+}
+
+/// Total KV blocks (block_size = 1 token) across the AFD A pool: the
+/// memory gate's per-GPU KV budget converted to tokens and summed over the
+/// A workers (`n_a_nodes * gpus_per_node / tp_a`, mirroring the runner's
+/// `n_a_workers` derivation).
+fn afd_derived_kv_blocks(
+    n_a_nodes: u32,
+    gpus_per_node: u32,
+    tp_a: u32,
+    kv_budget_bytes_per_gpu: f64,
+    kv_bytes_per_token_per_gpu: f64,
+) -> Result<usize> {
+    let tokens_per_gpu = (kv_budget_bytes_per_gpu / kv_bytes_per_token_per_gpu).floor();
+    ensure!(
+        tokens_per_gpu >= 1.0,
+        "AFD A-pool KV budget {kv_budget_bytes_per_gpu:.0} B/GPU does not cover one token \
+         ({kv_bytes_per_token_per_gpu:.0} B/token)"
+    );
+    let n_a_workers = (n_a_nodes as usize * gpus_per_node as usize).max(1) / (tp_a as usize).max(1);
+    let total_tokens = n_a_workers as f64 * tokens_per_gpu;
+    ensure!(
+        total_tokens >= 1.0 && total_tokens <= usize::MAX as f64,
+        "AFD derived KV capacity {total_tokens} tokens is out of range"
+    );
+    Ok(total_tokens as usize)
 }
 
 fn runtime_paths(traffic: &RuntimeTraffic) -> Result<Vec<PathBuf>> {
@@ -2170,6 +2224,24 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn afd_derived_kv_blocks_sums_per_gpu_tokens_across_workers() {
+        // 40 GiB budget/GPU at 32 KiB/token -> 1_310_720 tokens/GPU; two A
+        // workers (2 nodes * 8 GPUs / tp_a 8) double the pool total.
+        let blocks = afd_derived_kv_blocks(2, 8, 8, 40.0 * (1u64 << 30) as f64, 32768.0).unwrap();
+        assert_eq!(blocks, 2 * 1_310_720);
+        // One worker when the node/TP ratio is unity.
+        let blocks = afd_derived_kv_blocks(1, 8, 8, 32768.0 * 16.0, 32768.0).unwrap();
+        assert_eq!(blocks, 16);
+        // A budget below one token per GPU fails loudly.
+        assert!(
+            afd_derived_kv_blocks(1, 8, 8, 100.0, 32768.0)
+                .unwrap_err()
+                .to_string()
+                .contains("does not cover one token")
+        );
+    }
 
     #[test]
     fn replay_python_error_preserves_contextual_resource_failure() {

@@ -95,6 +95,47 @@ def _pool_memory(
     return memory
 
 
+def _build_pool(
+    backend,
+    backend_name: str,
+    backend_version: str | None,
+    a_version: str,
+    model_path: str,
+    gpus_per_node: int,
+    phase: str,
+    pool: dict[str, Any],
+    *,
+    is_a_pool: bool,
+):
+    """Resolve one pool's database + model. Shared by the fit gate and the
+    KV-budget estimator so the two cannot drift."""
+    system = pool["system"]
+    version = backend_version or (
+        a_version if is_a_pool else get_latest_database_version(system=system, backend=backend_name)
+    )
+    if version is None:
+        raise AFDMemoryInfeasible(f"no perf database found for system={system!r}, backend={backend_name!r}")
+    database = get_database_view(system, backend_name, version, database_mode="SILICON", allow_missing_data=False)
+    if database is None:
+        raise AFDMemoryInfeasible(
+            f"failed to load the perf database for system={system!r}, backend={backend_name!r}, version={version!r}"
+        )
+    if is_a_pool:
+        tp = pool["tp_a"]
+        model_config = build_model_config(tp, 1, 1, tp, 1)
+        # The A-worker runs context attention whenever the phase covers
+        # prefill ("prefill" or "both") — the F-worker never touches FMHA.
+        resolve_context_fmha_by_data(
+            model_config, model_path, database, backend_name, is_context_role=phase != "decode"
+        )
+    else:
+        f_tp = pool["n_f_nodes"] * gpus_per_node
+        model_config = build_model_config(f_tp, 1, 1, f_tp // pool["f_moe_ep_size"], pool["f_moe_ep_size"])
+    resolve_dsv4_moe_arch(model_config, model_path, system_name=system, backend_name=backend_name)
+    resolve_nvfp4_for_system(model_config, system, model_path, backend_name=backend_name)
+    return database, get_model(model_path, model_config, backend.name.value)
+
+
 def check_afd_memory_fit(
     *,
     model_path: str,
@@ -135,31 +176,17 @@ def check_afd_memory_fit(
         raise AFDMemoryInfeasible(f"no perf database found for system={a_pool['system']!r}, backend={backend_name!r}")
 
     def build_pool(pool: dict[str, Any], *, is_a_pool: bool):
-        system = pool["system"]
-        version = backend_version or (
-            a_version if is_a_pool else get_latest_database_version(system=system, backend=backend_name)
+        return _build_pool(
+            backend,
+            backend_name,
+            backend_version,
+            a_version,
+            model_path,
+            gpus_per_node,
+            phase,
+            pool,
+            is_a_pool=is_a_pool,
         )
-        if version is None:
-            raise AFDMemoryInfeasible(f"no perf database found for system={system!r}, backend={backend_name!r}")
-        database = get_database_view(system, backend_name, version, database_mode="SILICON", allow_missing_data=False)
-        if database is None:
-            raise AFDMemoryInfeasible(
-                f"failed to load the perf database for system={system!r}, backend={backend_name!r}, version={version!r}"
-            )
-        if is_a_pool:
-            tp = pool["tp_a"]
-            model_config = build_model_config(tp, 1, 1, tp, 1)
-            # The A-worker runs context attention whenever the phase covers
-            # prefill ("prefill" or "both") — the F-worker never touches FMHA.
-            resolve_context_fmha_by_data(
-                model_config, model_path, database, backend_name, is_context_role=phase != "decode"
-            )
-        else:
-            f_tp = pool["n_f_nodes"] * gpus_per_node
-            model_config = build_model_config(f_tp, 1, 1, f_tp // pool["f_moe_ep_size"], pool["f_moe_ep_size"])
-        resolve_dsv4_moe_arch(model_config, model_path, system_name=system, backend_name=backend_name)
-        resolve_nvfp4_for_system(model_config, system, model_path, backend_name=backend_name)
-        return database, get_model(model_path, model_config, backend.name.value)
 
     num_microbatches = max(int(num_microbatches or 1), 1)
     a_micro_batch_size = max((a_batch_size + num_microbatches - 1) // num_microbatches, 1)
@@ -219,3 +246,106 @@ def check_afd_memory_fit(
                         f"the budget {kv_budget:.2f} GB on {pool['system']!r}; widen tp_a or the F pool, lower "
                         "a_batch_size, or use a system with more VRAM per GPU"
                     )
+
+
+def estimate_afd_kv_budget_bytes(
+    *,
+    model_path: str,
+    backend_name: str,
+    backend_version: str | None,
+    isl: int,
+    osl: int,
+    prefix: int,
+    a_pool: dict[str, Any],
+    gpus_per_node: int,
+    a_batch_size: int,
+    num_microbatches: int,
+    a_weight_gb: Mapping[str, float],
+    phase: str = "both",
+    max_seq_len: int | None = None,
+) -> tuple[float, float]:
+    """Return ``(kv_budget_bytes_per_gpu, kv_bytes_per_token_per_gpu)`` for the A pool.
+
+    Shares the fit gate's memory model so the admission capacity derived from
+    this estimate and the OOM check cannot drift. The budget is the minimum
+    over the covered phases (the decode phase is retract-relevant: its KV
+    footprint grows with generation; a prefill-only pool budgets on prefill).
+    The per-token price is measured at unit geometry (one sequence, no
+    microbatch multiplier) and is a phase-independent model property.
+    """
+
+    backend = get_backend(backend_name)
+    a_version = backend_version or get_latest_database_version(system=a_pool["system"], backend=backend_name)
+    if a_version is None:
+        raise AFDMemoryInfeasible(f"no perf database found for system={a_pool['system']!r}, backend={backend_name!r}")
+    database, model = _build_pool(
+        backend,
+        backend_name,
+        backend_version,
+        a_version,
+        model_path,
+        gpus_per_node,
+        phase,
+        a_pool,
+        is_a_pool=True,
+    )
+
+    num_microbatches = max(int(num_microbatches or 1), 1)
+    a_micro_batch_size = max((a_batch_size + num_microbatches - 1) // num_microbatches, 1)
+    check_phases = ("prefill", "decode") if phase == "both" else (phase,)
+    free_fraction = backend.get_default_free_gpu_memory_fraction(a_version)
+    reserved, tolerance = backend.get_kv_cache_memory_check_params()
+    mem_capacity_gb = int(database.system_spec["gpu"]["mem_capacity"]) / (1 << 30)
+
+    budget_gib: float | None = None
+    for check_phase in check_phases:
+        memory = _pool_memory(
+            backend,
+            database,
+            model,
+            partition_weight_gb=float(a_weight_gb[check_phase]),
+            phase=check_phase,
+            batch_size=a_micro_batch_size,
+            isl=isl,
+            osl=osl,
+            prefix=prefix,
+            max_seq_len=max_seq_len,
+            include_kvcache=True,
+            kvcache_multiplier=num_microbatches,
+        )
+        kv_gib = memory.get("kvcache", 0.0)
+        phase_budget = kv_cache_budget_bytes(
+            capacity=mem_capacity_gb,
+            non_kv=memory["total"] - kv_gib,
+            fraction=free_fraction,
+            of_free=backend.memory_fraction_of_free(),
+            reserved=reserved,
+            tolerance=tolerance,
+        )
+        budget_gib = phase_budget if budget_gib is None else min(budget_gib, phase_budget)
+
+    effective_seq = max_seq_len if max_seq_len is not None else isl + osl
+    unit = _pool_memory(
+        backend,
+        database,
+        model,
+        partition_weight_gb=0.0,
+        phase="decode",
+        batch_size=1,
+        isl=isl,
+        osl=osl,
+        prefix=prefix,
+        max_seq_len=max_seq_len,
+        include_kvcache=True,
+        kvcache_multiplier=1,
+    )
+    kv_per_token_gib = unit.get("kvcache", 0.0) / max(effective_seq, 1)
+    if budget_gib is None or budget_gib <= 0:
+        raise AFDMemoryInfeasible(
+            f"the A-pool KV budget on {a_pool['system']!r} is not positive ({budget_gib}); "
+            "widen tp_a or use a system with more VRAM per GPU"
+        )
+    if kv_per_token_gib <= 0:
+        raise AFDMemoryInfeasible("the A-pool KV per-token estimate is not positive")
+    gib = float(1 << 30)
+    return budget_gib * gib, kv_per_token_gib * gib
