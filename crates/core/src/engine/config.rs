@@ -164,8 +164,8 @@ pub struct AfdEngineConfig {
     pub gpus_per_node: u32,
     /// In-flight pipeline microbatches.
     pub num_microbatches: u32,
-    /// Pipeline cadence model (serial / conservative / optimistic with the
-    /// min-microbatch degradation rule).
+    /// Pipeline cadence model (no_overlap / partial_overlap / full_overlap
+    /// with the min-microbatch degradation rule).
     pub pipeline_model: crate::perfmodel::afd::model::AfdPipelineModel,
     /// Applied exactly once, at pipeline evaluation, on the transfer terms;
     /// the measurement side stays 1.0.
@@ -206,12 +206,6 @@ impl AfdEngineConfig {
         ensure!(
             self.comm_overhead_factor.is_finite() && self.comm_overhead_factor > 0.0,
             "afd comm_overhead_factor must be a positive finite number"
-        );
-        ensure!(
-            self.phase == AfdPoolPhase::Both,
-            "afd phase={:?} requires the two-pool afd+pd handoff, which the continuous \
-             SglangCore AFD path does not implement yet; use phase=both",
-            self.phase
         );
         Ok(())
     }
@@ -826,6 +820,23 @@ impl EngineConfig {
         self.validate_state_cache()?;
         if let Some(afd) = &self.afd {
             afd.validate()?;
+            // The AFD pool's phase must match the rank's scheduling role:
+            // pure AFD (both) runs aggregated on one pool, while an afd+pd
+            // role serves exactly one phase with the opposite phase on the
+            // monolithic companion pool. The disagg pairing itself is
+            // enforced by the replay topology, not here.
+            let expected_role = match afd.phase {
+                AfdPoolPhase::Both => WorkerType::Aggregated,
+                AfdPoolPhase::Prefill => WorkerType::Prefill,
+                AfdPoolPhase::Decode => WorkerType::Decode,
+            };
+            ensure!(
+                self.worker_type == expected_role,
+                "afd phase={:?} requires worker_type={:?} (got {:?})",
+                afd.phase,
+                expected_role,
+                self.worker_type,
+            );
         }
         ensure!(self.num_gpu_blocks > 0, "num_gpu_blocks must be positive");
         ensure!(self.block_size > 0, "block_size must be positive");
@@ -1052,7 +1063,7 @@ mod tests {
                 "f_pool": {"system": "b200_sxm", "f_moe_ep_size": 1, "n_f_nodes": 1},
                 "gpus_per_node": 8,
                 "num_microbatches": 3,
-                "pipeline_model": "optimistic",
+                "pipeline_model": "full_overlap",
                 "comm_overhead_factor": 1.0,
                 "boundary_on_attn": true,
             },
@@ -1097,32 +1108,57 @@ mod tests {
         afd.validate().expect("depth == a_batch_size validates");
     }
 
-    /// Single-phase AFD roles only make sense with the two-pool afd+pd
-    /// handoff, which the continuous SglangCore path does not implement.
+    /// Single-phase AFD roles are the afd+pd form: legal when the rank's
+    /// worker_type matches the phase (the disagg topology supplies the
+    /// complementary companion), rejected otherwise.
     #[test]
-    fn afd_wire_rejects_single_phase_until_the_two_pool_handoff_lands() {
-        for phase in ["prefill", "decode"] {
+    fn afd_phase_must_match_worker_role() {
+        for (phase, worker_type, valid) in [
+            (AfdPoolPhase::Both, WorkerType::Aggregated, true),
+            (AfdPoolPhase::Prefill, WorkerType::Prefill, true),
+            (AfdPoolPhase::Decode, WorkerType::Decode, true),
+            (AfdPoolPhase::Both, WorkerType::Prefill, false),
+            (AfdPoolPhase::Both, WorkerType::Decode, false),
+            (AfdPoolPhase::Prefill, WorkerType::Aggregated, false),
+            (AfdPoolPhase::Decode, WorkerType::Aggregated, false),
+        ] {
             let json = serde_json::json!({
                 "backend": "sglang",
                 "num_gpu_blocks": 1024,
                 "block_size": 1,
+                "worker_type": match worker_type {
+                    WorkerType::Aggregated => "aggregated",
+                    WorkerType::Prefill => "prefill",
+                    WorkerType::Decode => "decode",
+                },
                 "afd": {
                     "a_pool": {"system": "h200_sxm", "tp_a": 8, "n_a_nodes": 1, "a_batch_size": 18},
                     "f_pool": {"system": "b200_sxm", "f_moe_ep_size": 1, "n_f_nodes": 1},
-                    "phase": phase,
+                    "phase": match phase {
+                        AfdPoolPhase::Both => "both",
+                        AfdPoolPhase::Prefill => "prefill",
+                        AfdPoolPhase::Decode => "decode",
+                    },
                     "gpus_per_node": 8,
                     "num_microbatches": 3,
-                    "pipeline_model": "optimistic",
+                    "pipeline_model": "full_overlap",
                     "comm_overhead_factor": 1.0,
                     "boundary_on_attn": true,
                 },
             });
             let config: EngineConfig = serde_json::from_value(json).expect("afd wire decode");
-            let error = config.validate().expect_err("single-phase afd wire");
-            assert!(
-                error.to_string().contains("two-pool afd+pd handoff"),
-                "phase={phase}: {error}"
-            );
+            let result = config.validate();
+            if valid {
+                result.unwrap_or_else(|error| {
+                    panic!("phase={phase:?} worker_type={worker_type:?} must validate: {error}")
+                });
+            } else {
+                let error = result.expect_err("mismatched phase and role must fail");
+                assert!(
+                    error.to_string().contains("requires worker_type"),
+                    "phase={phase:?} worker_type={worker_type:?}: {error}"
+                );
+            }
         }
     }
 

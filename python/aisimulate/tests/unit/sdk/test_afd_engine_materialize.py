@@ -8,9 +8,9 @@ verify width (cost side); the rank config's ``aic_nextn`` /
 ``aic_nextn_accept_rates`` build the scheduling core's burst sampler
 (benefit side). Both must be emitted together or the decode passes silently
 emit one token per pass while paying the verify width. Also pins the
-continuous-batching scheduler derivation (max_num_seqs / num_gpu_blocks /
-prefill pins) and the fail-loud retirement gates (non-sglang backend,
-phase != both).
+continuous-batching scheduler derivation (max_num_seqs and the prefill
+pins; num_gpu_blocks is derived natively from the memory gate) and the
+fail-loud gates (non-sglang backend, pure-AFD phase != both).
 """
 
 from __future__ import annotations
@@ -117,10 +117,93 @@ def test_pipeline_fill_mode_defaults_to_per_pass():
     assert engine["timing_model"]["config"]["pipeline_fill_mode"] == "per_pass"
 
 
+def test_explicit_chunked_prefill_size_overrides_the_prompt_window_pin():
+    topology = {
+        "phase": "both",
+        "tp_a": 8,
+        "n_a_nodes": 1,
+        "a_batch_size": 18,
+        "f_moe_ep_size": 1,
+        "n_f_nodes": 1,
+        "gpus_per_node": 8,
+        "num_microbatches": 3,
+        "chunked_prefill_size": 256,
+    }
+    deployment = BackendDeploymentSpec(
+        deployment_mode="afd",
+        backend="sglang",
+        backend_version="0.5.14",
+        parallel_config={"afd": topology},
+        performance_model_metadata={"afd": _metadata()},
+    )
+    spec = _spec(deployment)
+    engine = _materialize_afd_engine_role(spec.backend_deployment, spec)["rank"]
+
+    # The explicit window replaces the prompt pin on BOTH prefill budgets;
+    # the KV window (max_model_len) is unaffected.
+    assert engine["sglang"] == {"chunked_prefill_size": 256, "max_prefill_tokens": 256}
+    assert engine["max_model_len"] == 1024 + 128
+
+
 def test_non_both_phase_is_rejected_loudly():
-    # afd+pd two-pool handoff is retired on the continuous path (future work).
+    # Pure AFD (deployment_mode='afd') serves both phases; a single-phase
+    # topology must go through deployment_mode='afd+pd'.
     spec = _spec(_deployment(_metadata(nextn=1, nextn_accepted=0.85), phase="decode"))
-    with pytest.raises(InvalidRunnerError, match="two-pool afd\\+pd handoff"):
+    with pytest.raises(InvalidRunnerError, match="requires phase='both'"):
+        _materialize_afd_engine_role(spec.backend_deployment, spec)
+
+
+def _plus_pd_deployment(metadata: dict, *, phase: str = "decode") -> BackendDeploymentSpec:
+    topology = {
+        "phase": phase,
+        "tp_a": 8,
+        "n_a_nodes": 1,
+        "a_batch_size": 18,
+        "f_moe_ep_size": 1,
+        "n_f_nodes": 1,
+        "gpus_per_node": 8,
+        "num_microbatches": 3,
+    }
+    companion_role = "prefill" if phase == "decode" else "decode"
+    return BackendDeploymentSpec(
+        deployment_mode="afd+pd",
+        backend="sglang",
+        backend_version="0.5.14",
+        parallel_config={"afd": topology, f"{companion_role}_replicas": 2},
+        performance_model_metadata={"afd": metadata},
+        **{
+            f"{companion_role}_engine_args": {
+                "timing_model": {"type": "fixed", "prefill_ms": 2.0, "decode_ms": 2.0},
+                "num_gpu_blocks": 512,
+                "block_size": 16,
+            },
+            f"num_{companion_role}_workers": 2,
+        },
+    )
+
+
+def test_afd_plus_pd_materializes_the_two_role_disaggregated_topology():
+    spec = _spec(
+        _plus_pd_deployment(_metadata()),
+        workload={"isl": 1024, "osl": 128, "concurrency": 2, "request_count": 4},
+    )
+    execution = runner._materialize_engine_execution_spec(spec, trace_block_size=64, record_per_request=False)
+
+    assert execution["topology"]["kind"] == "disaggregated"
+    # decode-phase AFD pool sits in the decode slot with one pool-pair rank;
+    # the prefill companion scales by its replica count.
+    assert execution["topology"]["decode"] == {"initial_workers": 1, "startup_delay_ms": 0.0}
+    assert execution["topology"]["prefill"]["initial_workers"] == 2
+    afd_rank = execution["engine"]["decode"]["rank"]
+    assert afd_rank["afd"]["phase"] == "decode"
+    assert afd_rank["timing_model"]["provider"] == "aic-afd"
+    prefill_rank = execution["engine"]["prefill"]["rank"]
+    assert "afd" not in prefill_rank
+
+
+def test_afd_plus_pd_rejects_phase_both_loudly():
+    spec = _spec(_plus_pd_deployment(_metadata(), phase="both"))
+    with pytest.raises(InvalidRunnerError, match="one phase"):
         _materialize_afd_engine_role(spec.backend_deployment, spec)
 
 
@@ -153,9 +236,10 @@ def test_no_mtp_leaves_the_rank_config_without_speculation_keys():
 
 
 def test_scheduler_derivation_for_synthetic_workload():
-    # max_num_seqs mirrors the pool's in-flight capacity; num_gpu_blocks keeps
-    # the radix admission from binding below it; the prefill knobs pin one
-    # prompt per pass (the timing identity charges one frozen prefill step).
+    # max_num_seqs mirrors the pool's in-flight capacity; num_gpu_blocks is
+    # derived natively from the memory gate (physical capacity, not a
+    # sentinel); the prefill knobs pin one prompt per pass (the timing identity
+    # charges one frozen prefill step).
     spec = _spec(_deployment(_metadata()))
     engine = _materialize_afd_engine_role(spec.backend_deployment, spec)["rank"]
 
@@ -181,7 +265,7 @@ def test_scheduler_derivation_uses_the_context_window_when_present():
 def test_context_length_below_isl_plus_osl_is_rejected_loudly():
     # The derivation pins the prompt window AND the KV window at
     # context_length, so a window that cannot hold the declared workload would
-    # silently chunk the prompt and undersize num_gpu_blocks.
+    # silently chunk the prompt (and undersize the derived KV capacity).
     spec = _spec(_deployment(_metadata(context_length=512)))
     with pytest.raises(InvalidRunnerError, match="cannot hold isl\\+osl"):
         _materialize_afd_engine_role(spec.backend_deployment, spec)
@@ -201,12 +285,15 @@ def test_variable_length_traffic_is_exempt_from_the_window_lower_bound():
     assert "num_gpu_blocks" not in engine
 
 
-def test_afd_capability_surface_is_exactly_sglang_pure_afd():
+def test_afd_capability_surface_is_exactly_sglang_afd_topologies():
     # Guards against the advertised capability set drifting away from what
     # `_materialize_engine_execution_spec` actually accepts: every other
-    # backend/topology AFD combination is fail-loud retired.
+    # backend/topology AFD combination is fail-loud rejected.
     topologies = runner.EngineReplayRunnerFactory().capabilities().supported_backend_topologies
-    assert {entry for entry in topologies if entry[1].startswith("afd")} == {("sglang", "afd")}
+    assert {entry for entry in topologies if entry[1].startswith("afd")} == {
+        ("sglang", "afd"),
+        ("sglang", "afd+pd"),
+    }
 
 
 def test_trace_workload_without_context_length_reserves_the_model_window(monkeypatch):

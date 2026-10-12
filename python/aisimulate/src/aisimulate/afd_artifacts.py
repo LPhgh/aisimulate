@@ -32,11 +32,10 @@ def _mapping(value: Any, path: str) -> Mapping[str, Any]:
 
 def _topology_from_deployment(spec: ReplaySpec) -> tuple[AFDTopology, Mapping[str, Any]]:
     deployment = spec.backend_deployment
-    if deployment.deployment_mode != "afd":
+    if deployment.deployment_mode not in {"afd", "afd+pd"}:
         raise AFDQualificationError(
-            "AFD qualification covers deployment_mode='afd' (phase='both' pure AFD pool) only; "
-            "afd+pd (two-pool prefill/decode handoff) is not supported by the continuous "
-            "SglangCore AFD path yet"
+            "AFD qualification covers deployment_mode 'afd' (phase='both' pure AFD pool) and "
+            f"'afd+pd' (AFD pool plus a monolithic P/D companion), got {deployment.deployment_mode!r}"
         )
     if deployment.encoder is not None or spec.workload.get("images") is not None:
         raise AFDQualificationError("AFD qualification does not support analytical EPD encoder pools or images")
@@ -135,17 +134,46 @@ def build_afd_qualification(spec: ReplaySpec) -> dict[str, JSONValue]:
 
     topology, provenance = _topology_from_deployment(spec)
     measurement_metadata = _validate_measurements(spec, topology)
-    # afd+pd is rejected above, so companion provenance can only be stale.
-    if provenance.get("companion_role") is not None or provenance.get("companion") is not None:
+    companion_plan: dict[str, JSONValue] | None = None
+    companion_gpus = 0
+    if topology.combined_with_pd:
+        expected_role = "decode" if topology.phase.value == "prefill" else "prefill"
+        if provenance.get("companion_role") != expected_role:
+            raise AFDQualificationError(
+                f"afd+pd phase={topology.phase.value!r} requires afd_provenance.companion_role="
+                f"{expected_role!r}, got {provenance.get('companion_role')!r}"
+            )
+        companion_raw = _mapping(provenance.get("companion"), "afd_provenance.companion")
+        shape = _mapping(companion_raw.get("shape"), "afd_provenance.companion.shape")
+        replicas = companion_raw.get("replicas")
+        if not isinstance(replicas, int) or isinstance(replicas, bool) or replicas < 1:
+            raise AFDQualificationError("afd_provenance.companion.replicas must be a positive integer")
+        tp = shape.get("tp")
+        pp = shape.get("pp", 1)
+        dp = shape.get("dp")
+        if not all(isinstance(v, int) and not isinstance(v, bool) and v >= 1 for v in (tp, pp, dp)):
+            raise AFDQualificationError("afd_provenance.companion.shape tp/pp/dp must be positive integers")
+        companion_gpus = tp * pp * dp * replicas
+        companion_plan = {
+            "role": expected_role,
+            "replicas": replicas,
+            "gpus": companion_gpus,
+            "tensor_parallel_size": tp,
+            "pipeline_parallel_size": pp,
+            "attention_data_parallel_size": dp,
+            "moe_tensor_parallel_size": shape.get("moe_tp"),
+            "moe_expert_parallel_size": shape.get("moe_ep"),
+        }
+    elif provenance.get("companion_role") is not None or provenance.get("companion") is not None:
         raise AFDQualificationError("pure AFD cannot contain a P/D companion")
     accounting = _mapping(provenance.get("gpu_accounting"), "afd_provenance.gpu_accounting")
     expected_accounting = {
         "attention_gpus": topology.attention_gpus,
         "ffn_gpus": topology.ffn_gpus,
         # The companion slot stays in the schema as a constant so the artifact
-        # shape does not shift when the two-pool handoff lands.
-        "companion_gpus": 0,
-        "total_gpus": topology.total_gpus,
+        # shape does not shift between pure AFD and afd+pd.
+        "companion_gpus": companion_gpus,
+        "total_gpus": topology.total_gpus + companion_gpus,
     }
     if dict(accounting) != expected_accounting:
         raise AFDQualificationError(
@@ -195,7 +223,7 @@ def build_afd_qualification(spec: ReplaySpec) -> dict[str, JSONValue]:
                     "tensor_parallel_size": topology.ffn_tp,
                     "moe_expert_parallel_size": topology.f_moe_ep_size,
                 },
-                "companion": None,
+                "companion": companion_plan,
             },
             "gpu_accounting": expected_accounting,
             "launch": {

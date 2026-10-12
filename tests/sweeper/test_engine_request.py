@@ -400,15 +400,16 @@ def test_cached_prefix_tokens_are_accepted_for_afd():
 def test_runner_advertises_only_the_continuous_sglang_afd_path():
     # The capability table drives both sweeper enumeration pruning and
     # require_compatible, so it must not advertise AFD shapes the runner
-    # rejects later (non-sglang backends, the retired two-pool afd+pd).
+    # rejects later (non-sglang backends).
     from aisimulate.runner import EngineReplayRunnerFactory
 
     capabilities = EngineReplayRunnerFactory().capabilities()
 
     assert capabilities.supports_backend_topology("sglang", "afd")
+    assert capabilities.supports_backend_topology("sglang", "afd+pd")
     assert not capabilities.supports_backend_topology("vllm", "afd")
     assert not capabilities.supports_backend_topology("trtllm", "afd")
-    assert not capabilities.supports_backend_topology("sglang", "afd+pd")
+    assert not capabilities.supports_backend_topology("vllm", "afd+pd")
 
 
 @pytest.mark.parametrize(

@@ -1,0 +1,44 @@
+# afd+pd prediction (AFD pool = decode role, monolithic prefill companion).
+#
+# Maps to the runner's internal deployment_mode="afd+pd": the AFD pool (decode
+# role) and a monolithic prefill companion run on the generic two-pool disagg
+# orchestration (SglangCore continuous batching + DestinationFirst handoff),
+# with the `"aic-afd"` timing provider injected on the AFD role and the
+# companion on the standard aic provider. Scheduling and perf data are anchored
+# to the sglang family together.
+#
+# Conventions:
+#   - afd+pd requires a single phase (prefill|decode); the companion serves the
+#     opposite phase
+#   - phase=decode here, so workers.prefill is the monolithic companion
+#   - a_batch_size must be a concrete memory-qualified value (no implicit default)
+#   - backend_version is pinned explicitly so the golden never drifts with DB updates
+
+traffic:
+  source: {type: synthetic, input_tokens: 1024, output_tokens: 128}
+  load:   {type: concurrency, concurrency: 8}
+  stop:   {requests: 32}
+
+engine:
+  mode: afd
+  model: Qwen/Qwen3-32B
+  hardware: h200_sxm          # node width 8
+  backend: sglang
+  backend_version: "0.5.14"
+  context_length: max
+  afd:
+    phase: decode             # the AFD pool serves decode
+    combined_with_pd: true
+    n_a_nodes: 1              # A pool (attention) node count
+    n_f_nodes: 1              # F pool (FFN/MoE) node count
+    tp_a: 8                   # TP of the A worker; must divide gpus_per_node
+    a_batch_size: 18         # per-A-worker batch
+    num_microbatches: 3
+    pipeline_model: full_overlap
+  workers:
+    prefill:                  # monolithic prefill companion (standard aic provider)
+      parallelism: {replicas: 1, tensor: 8, pipeline: 1, attention_data: 1, moe_tensor: 1, moe_expert: 1}
+      scheduler: {max_batched_tokens: 8192, max_sequences: 18}
+
+evaluation:
+  sla: {ttft_ms: 800, itl_ms: 30}

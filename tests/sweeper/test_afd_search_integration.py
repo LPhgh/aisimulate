@@ -50,8 +50,29 @@ def _topology(*, n_a_nodes: int = 1, n_f_nodes: int = 1) -> dict:
 
 @pytest.mark.parametrize("mode", ["afd"])
 def test_afd_rejects_chunked_prefill_control(mode):
-    with pytest.raises(ValidationError, match="enable_chunked_prefill is unsupported for AFD"):
+    with pytest.raises(ValidationError, match="afd.chunked_prefill_size"):
         _config(mode, enable_chunked_prefill=True)
+
+
+def test_afd_chunked_prefill_size_is_accepted():
+    from aisimulate.config.engine import EnginePredictionConfig
+
+    config = EnginePredictionConfig(
+        model="Qwen/Qwen3-32B",
+        hardware="h200_sxm",
+        mode="afd",
+        backend="sglang",
+        afd={
+            "phase": "both",
+            "combined_with_pd": False,
+            "n_a_nodes": 1,
+            "n_f_nodes": 1,
+            "tp_a": 8,
+            "a_batch_size": 32,
+            "chunked_prefill_size": 256,
+        },
+    )
+    assert config.afd is not None and config.afd.chunked_prefill_size == 256
 
 
 def _config(mode: str, **search_overrides) -> SmartSearchConfig:
@@ -108,11 +129,46 @@ def test_pure_afd_uses_finite_generic_sampler_and_serializes_no_engine(monkeypat
     assert deployment.performance_model_metadata["afd"]["measurement_required"] is False
 
 
-def test_afd_plus_pd_is_rejected_loudly_at_config_validation():
-    # afd+pd two-pool handoff is retired on the continuous path (future work);
-    # the search config must fail loud instead of silently degrading.
-    with pytest.raises(ValidationError, match="two-pool prefill/decode handoff"):
-        _config("afd+pd", afd_phase="decode")
+def test_afd_plus_pd_validates_with_a_single_phase():
+    config = _config("afd+pd", afd_phase="decode")
+    assert config.search_space.deployment_mode == ["afd+pd"]
+    with pytest.raises(ValidationError, match="requires afd_phase 'prefill' or 'decode'"):
+        _config("afd+pd", afd_phase="both")
+
+
+def test_afd_plus_pd_enumerates_companion_product_and_builds_deployment(monkeypatch):
+    monkeypatch.setattr(
+        "aisimulate.sweeper.search_space.resolve_model_hardware",
+        lambda *args, **kwargs: _model_hardware(),
+    )
+    companion = ReplicaParallelConfig(shape=ParallelShape(tp=2, dp=1, moe_tp=1, moe_ep=1), replicas=1)
+    monkeypatch.setattr(
+        "aisimulate.sweeper.search_space.parallel_configs_for",
+        lambda *args, **kwargs: [companion],
+    )
+    config = _config(
+        "afd+pd",
+        afd_phase="decode",
+        afd_pinned_topologies=[_topology()],
+    )
+
+    (branch,) = enumerate_branches(config, runner_capabilities=_capabilities("afd+pd"))
+    suggestion = RandomBranchSampler(branch, seed=7).suggest(1)[0]
+    sample = unroll_sample(
+        search_space=config.search_space,
+        selection=suggestion.selection,
+        parallel_config=suggestion.parallel_config,
+    )
+    deployment = build_backend_deployment(sample, backend_version="test")
+
+    assert sample["deployment_mode"] == "afd+pd"
+    assert sample["afd_companion_role"] == "prefill"
+    assert sample["afd"]["phase"] == "decode"
+    assert deployment.prefill_engine_args is not None
+    assert deployment.decode_engine_args is None
+    assert deployment.num_prefill_workers == 1
+    assert deployment.performance_model_metadata["afd"]["provider"] == "aic-afd"
+    assert deployment.parallel_config["afd_provenance"]["gpu_accounting"]["companion_gpus"] == 2
 
 
 @pytest.mark.parametrize("pinned", [False, True])
@@ -213,11 +269,11 @@ def test_afd_complete_domain_limit_fails_instead_of_truncating(monkeypatch):
     assert exc_info.value.category is AFDReasonCategory.CANDIDATE_LIMIT
 
 
-def test_afd_combined_product_limit_is_retired_with_afd_plus_pd():
-    # The companion product enumeration was afd+pd-only; with the mode
-    # retired, the config gate fires before any candidate generation.
-    with pytest.raises(ValidationError, match="two-pool prefill/decode handoff"):
-        _config("afd+pd", afd_max_candidates=2)
+def test_afd_plus_pd_keeps_the_combined_candidate_limit():
+    # The companion product enumeration is afd+pd-only; the combined candidate
+    # limit stays configurable for it.
+    config = _config("afd+pd", afd_phase="decode", afd_max_candidates=2)
+    assert config.search_space.afd_max_candidates == 2
 
 
 @pytest.mark.parametrize(
@@ -227,10 +283,11 @@ def test_afd_combined_product_limit_is_retired_with_afd_plus_pd():
         (
             {
                 "deployment_mode": ["afd+pd"],
+                "backend": ["sglang"],
                 "afd_phase": "both",
                 "afd_batch_size_candidates": [1],
             },
-            "two-pool prefill/decode handoff",
+            "requires afd_phase 'prefill' or 'decode'",
         ),
     ],
 )

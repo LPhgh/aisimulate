@@ -509,14 +509,83 @@ def test_afd_prediction_rejects_non_sglang_backend(backend):
         )
 
 
+def _companion_worker_payload():
+    return {
+        "parallelism": {
+            "replicas": 1,
+            "tensor": 8,
+            "pipeline": 1,
+            "attention_data": 1,
+            "moe_tensor": 1,
+            "moe_expert": 1,
+        },
+        "scheduler": {"max_batched_tokens": 8192, "max_sequences": 8},
+        "kv_cache": {
+            "block_size": 16,
+            "prefix_caching": True,
+            "capacity": {"type": "fixed", "blocks": 128},
+        },
+        "timing": {"type": "fixed", "prefill_ms": 2.0, "decode_ms": 2.0},
+    }
+
+
+def _companion_recommendation_worker_payload():
+    payload = _companion_worker_payload()
+    payload["parallelism"] = {
+        "preset": [
+            {
+                "replicas": 1,
+                "tensor": 8,
+                "pipeline": 1,
+                "attention_data": 1,
+                "moe_tensor": 1,
+                "moe_expert": 1,
+            }
+        ]
+    }
+    return payload
+
+
+def test_afd_plus_pd_prediction_accepts_single_phase_with_companion():
+    config = EnginePredictionConfig(
+        model="Qwen/Qwen3-32B",
+        hardware="h200_sxm",
+        mode="afd",
+        backend="sglang",
+        afd=_afd_topology_payload(phase="decode", combined_with_pd=True),
+        workers={"prefill": _companion_worker_payload()},
+    )
+    assert config.afd is not None and config.afd.combined_with_pd
+
+
 def test_afd_prediction_rejects_combined_with_pd():
-    with pytest.raises(ValidationError, match="two-pool prefill/decode handoff"):
+    with pytest.raises(ValidationError, match="requires afd.phase='prefill' or 'decode'"):
+        EnginePredictionConfig(
+            model="Qwen/Qwen3-32B",
+            hardware="h200_sxm",
+            mode="afd",
+            backend="sglang",
+            afd=_afd_topology_payload(phase="both", combined_with_pd=True),
+        )
+
+
+def test_afd_plus_pd_prediction_requires_the_opposite_phase_companion():
+    with pytest.raises(ValidationError, match="workers.prefill"):
         EnginePredictionConfig(
             model="Qwen/Qwen3-32B",
             hardware="h200_sxm",
             mode="afd",
             backend="sglang",
             afd=_afd_topology_payload(phase="decode", combined_with_pd=True),
+        )
+    with pytest.raises(ValidationError, match="workers.decode"):
+        EnginePredictionConfig(
+            model="Qwen/Qwen3-32B",
+            hardware="h200_sxm",
+            mode="afd",
+            backend="sglang",
+            afd=_afd_topology_payload(phase="prefill", combined_with_pd=True),
+            workers={"prefill": _companion_worker_payload()},
         )
 
 
@@ -543,7 +612,34 @@ def test_afd_recommendation_applies_the_same_gates():
     with pytest.raises(ValidationError, match="continuous SGLang scheduling core"):
         # The default backend domain ("vllm", "sglang") is not the pinned sglang anchor.
         EngineRecommendationConfig(**base)
-    with pytest.raises(ValidationError, match="two-pool prefill/decode handoff"):
+    # afd+pd is legal for recommendation with the opposite-phase companion
+    # worker (its parallelism preset pins the searched companion shapes).
+    accepted_plus_pd = EngineRecommendationConfig(
+        **{
+            **base,
+            "afd": {"phase": "decode", "combined_with_pd": True, "a_batch_size": 32},
+            "workers": {"prefill": _companion_recommendation_worker_payload()},
+        },
+        backend="sglang",
+    )
+    assert accepted_plus_pd.afd.combined_with_pd
+    with pytest.raises(ValidationError, match="requires afd.phase='prefill' or 'decode'"):
+        EngineRecommendationConfig(
+            **{
+                **base,
+                "afd": {"phase": "both", "combined_with_pd": True, "a_batch_size": 32},
+            },
+            backend="sglang",
+        )
+    with pytest.raises(ValidationError, match="requires afd.phase='both'"):
+        EngineRecommendationConfig(
+            **{
+                **base,
+                "afd": {"phase": "decode", "combined_with_pd": False, "a_batch_size": 32},
+            },
+            backend="sglang",
+        )
+    with pytest.raises(ValidationError, match="workers.prefill"):
         EngineRecommendationConfig(
             **{
                 **base,

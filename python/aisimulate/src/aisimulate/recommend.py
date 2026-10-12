@@ -120,6 +120,12 @@ def recommendation_to_sweeper(
     afd = engine.get("afd")
     if modes == ["afd"] and not isinstance(afd, dict):
         raise ValueError("engine.mode='afd' requires engine.afd")
+    afd_companion_role: str | None = None
+    if isinstance(afd, dict) and afd.get("combined_with_pd"):
+        # afd+pd searches the two-pool product: the AFD topology domain times
+        # the companion shapes pinned via the opposite-phase worker's preset.
+        modes = ["afd+pd" if mode == "afd" else mode for mode in modes]
+        afd_companion_role = "decode" if afd.get("phase") == "prefill" else "prefill"
     backend_values = _choices(engine.get("backend"), default=["vllm", "sglang"])
     model = engine.get("model")
     if not isinstance(model, str) or not model:
@@ -188,7 +194,32 @@ def recommendation_to_sweeper(
             search_space[f"{role}_hardware_sku"] = workers[role]["hardware"]
     if isinstance(afd, dict):
         search_space.update(_afd_search_space(afd))
-    search_space.update(_role_search_space(workers, modes))
+    if afd_companion_role is not None:
+        companion = workers.get(afd_companion_role)
+        if not isinstance(companion, dict):
+            raise ValueError(f"afd+pd requires engine.workers.{afd_companion_role} (the monolithic companion)")
+        preset = (companion.get("parallelism") or {}).get("preset")
+        if not isinstance(preset, list) or not preset:
+            raise ValueError(
+                f"afd+pd requires engine.workers.{afd_companion_role}.parallelism.preset "
+                "(explicit companion parallel shapes)"
+            )
+        search_space["afd_companion_parallel_configs"] = [
+            {
+                "tp": int(entry["tensor"]),
+                "pp": int(entry.get("pipeline", 1)),
+                "attention_dp": int(entry.get("attention_data", 1)),
+                "moe_tp": int(entry.get("moe_tensor", 1)),
+                "moe_ep": int(entry.get("moe_expert", 1)),
+                "replicas": int(entry.get("replicas", 1)),
+            }
+            for entry in preset
+        ]
+        # The companion's scheduler/KV knobs ride the same per-role search
+        # fields a disagg role uses; the AFD pool side needs none.
+        search_space.update(_role_search_space({afd_companion_role: companion}, [afd_companion_role]))
+    else:
+        search_space.update(_role_search_space(workers, modes))
     if engine.get("workers", {}).get("encoder") is not None:
         encoder = workers["encoder"]
         search_space["encoder"] = {
@@ -332,8 +363,8 @@ def _role_search_space(
     }
     specifications = (
         ("aggregated", "agg", "agg" in modes),
-        ("prefill", "prefill", "disagg" in modes),
-        ("decode", "decode", "disagg" in modes),
+        ("prefill", "prefill", "disagg" in modes or "prefill" in modes),
+        ("decode", "decode", "disagg" in modes or "decode" in modes),
     )
     for public_role, legacy_role, required in specifications:
         raw = workers.get(public_role)

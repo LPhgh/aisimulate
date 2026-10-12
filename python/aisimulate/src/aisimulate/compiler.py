@@ -259,7 +259,7 @@ def _afd_deployment(engine: EnginePredictionConfig) -> BackendDeploymentSpec:
             f"f_system={f_system!r} ({f_facts.gpus_per_node})"
         )
     topology = AFDTopology(
-        **afd.model_dump(mode="python", exclude={"a_system", "f_system", "pipeline_fill_mode"}),
+        **afd.model_dump(mode="python", exclude={"a_system", "f_system", "chunked_prefill_size", "pipeline_fill_mode"}),
         gpus_per_node=facts.gpus_per_node,
         is_moe=facts.is_moe,
         num_experts=facts.num_experts,
@@ -287,6 +287,10 @@ def _afd_deployment(engine: EnginePredictionConfig) -> BackendDeploymentSpec:
     parallel_config: dict[str, JSONValue] = {
         "afd": {
             **topology.provenance()["topology"],
+            # Scheduler/timing-level knobs, not topology-identity fields: the
+            # runner sizes the SGLang chunked-prefill budget and the
+            # provider's pipeline fill policy from them.
+            **({"chunked_prefill_size": afd.chunked_prefill_size} if afd.chunked_prefill_size else {}),
             **({"pipeline_fill_mode": afd.pipeline_fill_mode} if afd.pipeline_fill_mode != "per_pass" else {}),
         },
         "afd_provenance": afd_parallel.provenance(),

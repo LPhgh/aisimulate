@@ -553,12 +553,9 @@ class SearchSpace(BaseModel):
     encoder: EncoderSearch | None = None
 
     # Attention--FFN disaggregation. The A/F topology is a finite, complete
-    # domain. ``afd+pd`` (pairing each topology with one opposite-phase
-    # companion) is rejected by ``_validate_afd_contract`` until the two-pool
-    # handoff lands on the continuous SGLang core, so
-    # ``afd_companion_parallel_configs`` is inert for now: it is kept because
-    # any non-empty value must fail loudly rather than be ignored, and because
-    # the companion product returns with that handoff.
+    # domain. ``afd+pd`` pairs each topology with one opposite-phase companion
+    # drawn from ``afd_companion_parallel_configs`` on the generic two-pool
+    # handoff surface.
     afd_pinned_topologies: list[dict[str, Any]] = Field(default_factory=list)
     afd_companion_parallel_configs: list[dict[str, Any]] = Field(default_factory=list)
     afd_tp_a_candidates: list[int] | None = None
@@ -791,11 +788,6 @@ class SearchSpace(BaseModel):
     @model_validator(mode="after")
     def _validate_afd_contract(self) -> SearchSpace:
         afd_modes = [mode for mode in dict.fromkeys(self.deployment_mode) if mode in {"afd", "afd+pd"}]
-        if "afd+pd" in afd_modes:
-            raise ValueError(
-                "deployment_mode='afd+pd' (two-pool prefill/decode handoff) is not supported by "
-                "the continuous SglangCore AFD path yet; use deployment_mode='afd' (phase='both')"
-            )
         if afd_modes and self.backend != ["sglang"]:
             raise ValueError(
                 "AFD runs on the continuous SGLang scheduling core and anchors sglang perf data; "
@@ -803,8 +795,10 @@ class SearchSpace(BaseModel):
             )
         if self.afd_phase not in {"prefill", "decode", "both"}:
             raise ValueError("afd_phase must be 'prefill', 'decode', or 'both'")
-        if afd_modes and self.afd_phase != "both":
+        if "afd" in afd_modes and self.afd_phase != "both":
             raise ValueError("pure AFD search requires afd_phase='both'")
+        if "afd+pd" in afd_modes and self.afd_phase == "both":
+            raise ValueError("deployment_mode='afd+pd' requires afd_phase 'prefill' or 'decode'")
         if any(
             value
             not in {
@@ -962,7 +956,10 @@ class SearchSpace(BaseModel):
         if self.enable_chunked_prefill is not None and any(
             mode not in {"agg", "disagg"} for mode in self.deployment_mode
         ):
-            raise ValueError("enable_chunked_prefill is unsupported for AFD")
+            raise ValueError(
+                "enable_chunked_prefill is unsupported for AFD; "
+                "use engine.afd.chunked_prefill_size to size the chunked-prefill window"
+            )
         if self.aic_nextn and self.nextn_accepted is None:
             raise ValueError("aic_nextn requires explicit nextn_accepted")
         if self.nextn_accepted is not None and (not self.aic_nextn or self.nextn_accepted > self.aic_nextn):

@@ -9,6 +9,7 @@ import importlib
 import json
 import logging
 import math
+import os
 import random
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
@@ -46,9 +47,11 @@ _SUPPORTED_BACKEND_TOPOLOGIES = (
     ("trtllm", "agg"),
     ("trtllm", "disagg"),
     # AFD runs on the continuous SGLang core and anchors sglang perf data, so
-    # sglang is the only backend it can be materialized for; the two-pool
-    # afd+pd handoff is fail-loud future work (see _materialize_afd_engine_role).
+    # sglang is the only backend it can be materialized for. afd+pd pairs the
+    # AFD pool (one phase) with a monolithic companion on the generic
+    # disaggregated handoff surface.
     ("sglang", "afd"),
+    ("sglang", "afd+pd"),
 )
 
 _RUNTIME_TRAFFIC_FIELDS = frozenset(
@@ -354,6 +357,15 @@ class EngineReplayRunner:
         """
 
 
+def _afd_frozen_decode_identity(variable_length_traffic: bool) -> bool:
+    override = os.environ.get("AISIMULATE_AFD_FROZEN_DECODE_IDENTITY")
+    if override is not None:
+        if override not in {"0", "1"}:
+            raise InvalidRunnerError(f"AISIMULATE_AFD_FROZEN_DECODE_IDENTITY must be '0' or '1', got {override!r}")
+        return override == "1"
+    return not variable_length_traffic
+
+
 def _materialize_afd_engine_role(
     deployment: BackendDeploymentSpec,
     spec: ReplaySpec,
@@ -363,20 +375,26 @@ def _materialize_afd_engine_role(
     The AFD pool runs on the monolithic SGLang scheduling core (continuous
     admission + retraction) with the ``aic-afd`` timing provider injected;
     the ``afd`` topology rides along as pure metadata (GPU accounting and
-    the memory gate's phase). Only phase="both" (pure AFD pool) is
-    supported; the two-pool afd+pd handoff is future work. The provider
-    config mirrors Rust's ``AfdTimingConfig``
+    the memory gate's phase). Pure AFD (``deployment_mode="afd"``) requires
+    phase="both"; afd+pd assigns the pool exactly one phase and pairs it
+    with a monolithic companion on the generic disaggregated handoff
+    surface. The provider config mirrors Rust's ``AfdTimingConfig``
     (``crates/core/src/perfmodel/afd/model.rs``) field-for-field.
     """
 
     topology = deployment.parallel_config.get("afd")
     if not isinstance(topology, Mapping):
-        raise InvalidRunnerError("pure AFD replay requires parallel_config.afd topology provenance")
+        raise InvalidRunnerError("AFD replay requires parallel_config.afd topology provenance")
     resolved_phase = str(topology.get("phase") or "both")
-    if resolved_phase != "both":
+    if deployment.deployment_mode == "afd" and resolved_phase != "both":
         raise InvalidRunnerError(
-            f"AFD phase={resolved_phase!r} requires the two-pool afd+pd handoff, which the "
-            "continuous SglangCore path does not support yet; use phase='both' (pure AFD pool)"
+            f"pure AFD (deployment_mode='afd') requires phase='both', got phase={resolved_phase!r}; "
+            "use deployment_mode='afd+pd' for a single-phase AFD pool"
+        )
+    if deployment.deployment_mode == "afd+pd" and resolved_phase not in {"prefill", "decode"}:
+        raise InvalidRunnerError(
+            f"afd+pd requires the AFD pool to serve one phase (phase='prefill' or 'decode'), "
+            f"got phase={resolved_phase!r}"
         )
     metadata = deployment.performance_model_metadata.get("afd")
     if not isinstance(metadata, Mapping):
@@ -468,12 +486,17 @@ def _materialize_afd_engine_role(
         # KV window for the native memory gate (context_length = max reserves
         # the full window per request; absent means isl+osl).
         "max_seq_len": int(context_length or 0) or None,
+        # Pipeline fill policy: per_pass (default) or amortized
+        # (steady-state passes pay cycle terms only).
         "pipeline_fill_mode": str(topology.get("pipeline_fill_mode") or "per_pass"),
         # Decode identity: the frozen stride average only holds for
         # fixed synthetic workloads (random_range_ratio 1.0); anything with
         # per-request length variation uses the instantaneous per-pass pipeline
-        # evaluation (acceptance criterion 4).
-        "frozen_decode_identity": not variable_length_traffic,
+        # evaluation. Frozen-identity caliber override (not a
+        # public configuration surface): AISIMULATE_AFD_FROZEN_DECODE_IDENTITY
+        # =0/1 pins the knob so frozen-vs-instantaneous caliber studies can
+        # A/B the same workload.
+        "frozen_decode_identity": _afd_frozen_decode_identity(variable_length_traffic),
         # AfdTimingConfig mirrors the perf-model construction fields.
         # Estimator policy and explicit quant overrides pass through verbatim
         # (the aic-afd provider honors them). `phase` is excluded
@@ -486,33 +509,42 @@ def _materialize_afd_engine_role(
     }
     # The derivation below pins BOTH the prompt window and the KV window at
     # context_length, so an explicit window smaller than the declared workload
-    # cannot be honored: it would silently chunk the prompt (the AFD timing
-    # identity charges one frozen prefill step per pass) and undersize
-    # num_gpu_blocks below the in-flight footprint. Variable-length traffic is
-    # exempt because its isl/osl are upper bounds, not per-request lengths.
+    # cannot be honored: it would silently chunk the prompt and undersize the
+    # derived KV capacity below the in-flight footprint. Variable-length
+    # traffic is exempt because its isl/osl are upper bounds, not per-request
+    # lengths.
     declared_window = int(context_length or 0)
     if declared_window and not variable_length_traffic and declared_window < isl + osl:
         raise InvalidRunnerError(
             f"engine.context_length={declared_window} cannot hold isl+osl={isl + osl}. The AFD "
             "scheduler derivation pins the prompt window and the KV window at context_length, so a "
-            "smaller window would silently chunk the prompt (the timing identity charges one frozen "
-            "prefill step per pass) and size num_gpu_blocks below the in-flight footprint, truncating "
-            "admission under max_num_seqs. Raise context_length to at least isl+osl, or use 'max'."
+            "smaller window would silently chunk the prompt and undersize the derived KV capacity "
+            "below the in-flight footprint, truncating admission under max_num_seqs. Raise "
+            "context_length to at least isl+osl, or use 'max'."
         )
     # Continuous-batching scheduler derivation (SglangCore injection):
     # - max_num_seqs mirrors the pool's in-flight capacity
     #   (n_a_workers * a_batch_size, the timing provider's total_batch_size);
-    # - num_gpu_blocks is derived by the native provider from the per-pool
-    #   memory gate; runtime retraction reflects physical KV capacity;
-    # - chunked_prefill_size / max_prefill_tokens are pinned at the prompt
-    #   window so every prompt pre-fills in a single pass (the AFD timing
-    #   identity charges one frozen prefill step per pass);
+    # - num_gpu_blocks is intentionally NOT set: the native provider derives
+    #   the rank's KV capacity from the per-pool memory gate's A-pool budget
+    #   at construction, so runtime retraction reflects physical OOM;
+    # - chunked_prefill_size / max_prefill_tokens default to the prompt window
+    #   so every prompt pre-fills in a single pass; an explicit
+    #   afd.chunked_prefill_size smaller than the prompt enables SGLang's
+    #   native chunked prefill — each chunk pass is priced at its actual
+    #   (chunk tokens, prefix) geometry by the provider, never a full frozen
+    #   prompt step;
     # - max_model_len makes an over-long single prompt fail loudly inside
-    #   SglangCore instead of being silently chunked.
+    #   SglangCore instead of being silently dropped.
     block_size = 1  # SGLang page_size; read from SglangConfig once it exposes one.
     n_a_workers = max(1, a_pool["n_a_nodes"] * gpus_per_node // a_pool["tp_a"])
     max_num_seqs = n_a_workers * a_pool["a_batch_size"]
-    prompt_window = int(context_length or 0) or isl
+    explicit_chunk = (
+        _positive_int(topology["chunked_prefill_size"], "afd.chunked_prefill_size")
+        if topology.get("chunked_prefill_size")
+        else None
+    )
+    prompt_window = explicit_chunk or int(context_length or 0) or isl
     kv_window = int(context_length or 0) or (isl + osl)
     engine: dict[str, JSONValue] = {
         "backend": backend,
@@ -570,10 +602,56 @@ def _materialize_engine_execution_spec(
             },
         }
     elif deployment_mode == "afd+pd":
-        raise InvalidRunnerError(
-            "afd+pd (two-pool prefill/decode handoff) is not supported by the continuous "
-            "SglangCore AFD path yet; use deployment_mode='afd' (phase='both' pure AFD pool)"
+        afd_role = _materialize_afd_engine_role(deployment, spec)
+        afd_topology = deployment.parallel_config.get("afd")
+        afd_phase = str(afd_topology.get("phase")) if isinstance(afd_topology, Mapping) else ""
+        companion_role = "decode" if afd_phase == "prefill" else "prefill"
+        raw_companion = _required_engine_args(
+            deployment.decode_engine_args if companion_role == "decode" else deployment.prefill_engine_args,
+            companion_role,
         )
+        companion_workers = (
+            deployment.num_decode_workers if companion_role == "decode" else deployment.num_prefill_workers
+        )
+        companion = _materialize_engine_role(
+            deployment.backend,
+            deployment.backend_version,
+            deployment.parallel_config,
+            raw_companion,
+            companion_role,
+            memory_diagnostics=memory_diagnostics,
+        )
+        _require_parallel_match(
+            deployment.parallel_config,
+            f"{companion_role}_replicas",
+            companion_workers,
+            f"num_{companion_role}_workers",
+        )
+        # One rank models the whole AFD pool pair (same as pure AFD); the
+        # companion scales by its replica count. The Rust replay stamps each
+        # role's worker_type from its topology position and validates it
+        # against the AFD rank's phase metadata.
+        afd_workers: dict[str, JSONValue] = {"initial_workers": 1, "startup_delay_ms": 0.0}
+        companion_topology: dict[str, JSONValue] = {
+            "initial_workers": _positive_int(companion_workers, f"num_{companion_role}_workers"),
+            "startup_delay_ms": _startup_delay_ms(raw_companion),
+        }
+        if afd_phase == "prefill":
+            engine = {"prefill": afd_role, "decode": companion}
+            topology = {
+                "kind": "disaggregated",
+                "prefill": afd_workers,
+                "decode": companion_topology,
+                "handoff_latency_ms": 0.0,
+            }
+        else:
+            engine = {"prefill": companion, "decode": afd_role}
+            topology = {
+                "kind": "disaggregated",
+                "prefill": companion_topology,
+                "decode": afd_workers,
+                "handoff_latency_ms": 0.0,
+            }
     elif deployment_mode == "agg":
         raw_engine_args = _required_engine_args(deployment.agg_engine_args, "aggregated")
         execution_model = _execution_target_model(deployment, "aggregated", raw_engine_args)
@@ -650,8 +728,7 @@ def _materialize_engine_execution_spec(
         }
     else:
         raise ValueError(
-            "engine replay deployment_mode must be 'agg', 'disagg', or 'afd', got "
-            f"{deployment_mode!r} (afd+pd is rejected earlier with its own message)"
+            f"engine replay deployment_mode must be 'agg', 'disagg', 'afd', or 'afd+pd', got {deployment_mode!r}"
         )
 
     use_workload_driver = spec.workload.get("source_type") is not None

@@ -6,9 +6,10 @@
 # a_batch_size (18) = 18, while concurrency=24 > 18, so every pass has requests
 # queued in the waiting queue.
 #
-# Purpose: anchor the "saturated side" admission and retract behavior - the 1.25
-# headroom on num_gpu_blocks must keep the radix memory gate from truncating
-# below max_num_seqs (G1), and every prompt must complete its prefill within a
+# Purpose: anchor the "saturated side" admission and retract behavior - the
+# native provider derives num_gpu_blocks from the memory gate's A-pool KV
+# budget, which keeps the radix memory gate from truncating below max_num_seqs
+# for this workload (G1), and every prompt must complete its prefill within a
 # single pass (G2), never triggering retract across the run. The unsaturated
 # side is covered by afd-predict-pure.yaml; the two cases together pin both
 # sides of the admission boundary.

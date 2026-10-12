@@ -56,7 +56,17 @@ class AFDTopologyPredictionConfig(StrictModel):
     pipeline_model: AFDPipelineModel = "full_overlap"
     comm_overhead_factor: PositiveFloat = 1.0
     boundary_on_attn: bool = Field(default=True, strict=True)
-    # Pipeline fill charging policy for the AFD timing provider.
+    # Chunked-prefill window (SGLang native chunking). Unset pins the window
+    # at the prompt length so every prompt pre-fills in ONE pass (the
+    # conservative single-pass identity); a smaller explicit value lets long
+    # prompts chunk across multiple prefill passes, each priced at its actual
+    # (chunk tokens, prefix) geometry.
+    chunked_prefill_size: PositiveInt | None = None
+    # Pipeline fill charging policy: ``per_pass`` (default, conservative —
+    # every pass pays the fill) or ``amortized`` (steady-state decode passes
+    # pay cycle terms only; the fill is charged at pipeline startup and on
+    # boundary passes whose effective microbatch count is below the
+    # configured depth).
     pipeline_fill_mode: Literal["per_pass", "amortized"] = "per_pass"
     # Optional per-pool perf-DB systems for heterogeneous A/F SKU pairs.
     # Omit for homogeneous deployments (both pools inherit the
@@ -372,7 +382,10 @@ class EstimatorPolicyConfig(StrictModel):
         mode = getattr(self, "mode", "aggregated")
         modes = mode.choices if hasattr(mode, "choices") else [mode]
         if "afd" in modes and self.enable_chunked_prefill is not None:
-            raise ValueError("enable_chunked_prefill is unsupported for AFD")
+            raise ValueError(
+                "enable_chunked_prefill is unsupported for AFD; "
+                "use engine.afd.chunked_prefill_size to size the chunked-prefill window"
+            )
         if "afd" in modes:
             # The native AFD path supports nextn (the Rust
             # SpeculativeDecodeSampler carries acceptance) and the quant-mode
@@ -786,14 +799,19 @@ def _validate_prediction_afd(engine: EnginePredictionConfig) -> None:
             f"set engine.backend='sglang' (got {engine.backend!r})"
         )
     if afd.combined_with_pd:
-        raise ValueError(
-            "afd+pd (two-pool prefill/decode handoff) is not supported by the continuous "
-            "SglangCore AFD path yet; use phase='both' with combined_with_pd=false"
-        )
-    if afd.phase != "both":
-        raise ValueError("pure AFD prediction requires phase='both'")
-    if _configured_worker_roles(engine.workers):
-        raise ValueError("pure AFD prediction rejects regular aggregated/prefill/decode workers")
+        if afd.phase == "both":
+            raise ValueError("afd+pd (combined_with_pd=true) requires afd.phase='prefill' or 'decode'")
+        companion_role = "decode" if afd.phase == "prefill" else "prefill"
+        if _configured_worker_roles(engine.workers) != {companion_role}:
+            raise ValueError(
+                f"afd+pd with afd.phase={afd.phase!r} requires exactly the workers.{companion_role} "
+                "companion; the AFD pool itself needs no regular worker"
+            )
+    else:
+        if afd.phase != "both":
+            raise ValueError("pure AFD (combined_with_pd=false) requires afd.phase='both'")
+        if _configured_worker_roles(engine.workers):
+            raise ValueError("pure AFD prediction rejects regular aggregated/prefill/decode workers")
 
 
 def _validate_recommendation_afd(engine: EngineRecommendationConfig) -> None:
@@ -811,14 +829,19 @@ def _validate_recommendation_afd(engine: EngineRecommendationConfig) -> None:
             f"set engine.backend='sglang' (got {sorted(backends)!r})"
         )
     if afd.combined_with_pd:
-        raise ValueError(
-            "afd+pd (two-pool prefill/decode handoff) is not supported by the continuous "
-            "SglangCore AFD path yet; use phase='both' with combined_with_pd=false"
-        )
-    if afd.phase != "both":
-        raise ValueError("pure AFD recommendation requires phase='both'")
-    if _configured_worker_roles(engine.workers):
-        raise ValueError("pure AFD recommendation rejects regular aggregated/prefill/decode workers")
+        if afd.phase == "both":
+            raise ValueError("afd+pd (combined_with_pd=true) requires afd.phase='prefill' or 'decode'")
+        companion_role = "decode" if afd.phase == "prefill" else "prefill"
+        if _configured_worker_roles(engine.workers) != {companion_role}:
+            raise ValueError(
+                f"afd+pd with afd.phase={afd.phase!r} requires exactly the workers.{companion_role} "
+                "companion; the AFD pool itself needs no regular worker"
+            )
+    else:
+        if afd.phase != "both":
+            raise ValueError("pure AFD (combined_with_pd=false) requires afd.phase='both'")
+        if _configured_worker_roles(engine.workers):
+            raise ValueError("pure AFD recommendation rejects regular aggregated/prefill/decode workers")
 
 
 def _validate_prediction_host_offload(engine: EnginePredictionConfig) -> None:

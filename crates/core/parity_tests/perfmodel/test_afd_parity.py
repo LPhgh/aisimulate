@@ -16,11 +16,11 @@ timing provider) against the rebuilt goldens:
   data-drift guard for the perf-DB family the continuous path consumes.
 - `TestAfdE2eGolden` — `AISIMULATE_AFD_NATIVE=1` runs of the committed demo
   configs reproduce ``goldens/afd_e2e.json`` within 1e-6 relative (common
-  fields, wall-clock-derived fields excluded). Two cases bracket the admission
-  boundary: the unsaturated demo config and a saturated variant whose
-  concurrency exceeds `max_num_seqs`. The retired batch-locked AfdCore golden
-  and the two afd+pd cases were dropped: the two-pool handoff is fail-loud
-  future work on the continuous path.
+  fields, wall-clock-derived fields excluded). Two pure cases bracket the
+  admission boundary: the unsaturated demo config and a saturated variant
+  whose concurrency exceeds `max_num_seqs`. The afd+pd cases pair the AFD
+  pool with a monolithic companion on the two-pool handoff; the
+  chunked-prefill and fill-amortized cases pin the opt-in calibers.
 
 Run from the repository root:
 
@@ -51,6 +51,9 @@ import afd_parity
 E2E_CASES = (
     "qwen3-32b-h200-sglang-pure-both",
     "qwen3-32b-h200-sglang-pure-both-saturated",
+    "qwen3-32b-h200-sglang-pd-decode",
+    "qwen3-32b-h200-sglang-pd-prefill",
+    "qwen3-32b-h200-sglang-chunked-prefill",
     "qwen3-32b-h200-sglang-fill-amortized",
 )
 

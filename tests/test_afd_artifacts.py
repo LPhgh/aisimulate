@@ -125,20 +125,44 @@ def test_pure_afd_qualification_matches_golden() -> None:
     assert rendered == golden.read_text(encoding="utf-8")
 
 
-def test_afd_plus_pd_qualification_is_rejected_loudly() -> None:
-    # The two-pool prefill/decode handoff is fail-loud future work on the
-    # continuous SglangCore path, so neither companion role qualifies and the
-    # companion slot in the artifact schema stays a constant null/0.
-    for kwargs in (
-        {"combined_with_pd": True},
-        {"combined_with_pd": True, "afd_phase": "prefill"},
-    ):
-        with pytest.raises(AFDQualificationError, match="two-pool prefill/decode handoff"):
-            build_afd_qualification(_spec(**kwargs))
+def test_afd_plus_pd_qualification_covers_both_companion_roles() -> None:
+    for afd_phase, expected_role in (("decode", "prefill"), ("prefill", "decode")):
+        artifact = build_afd_qualification(_spec(combined_with_pd=True, afd_phase=afd_phase))
+        companion = artifact["deployment_plan"]["pools"]["companion"]
+        assert companion == {
+            "role": expected_role,
+            "replicas": 2,
+            "gpus": 4,
+            "tensor_parallel_size": 2,
+            "pipeline_parallel_size": 1,
+            "attention_data_parallel_size": 1,
+            "moe_tensor_parallel_size": 1,
+            "moe_expert_parallel_size": 1,
+        }
+        assert artifact["deployment_plan"]["gpu_accounting"] == {
+            "attention_gpus": 8,
+            "ffn_gpus": 8,
+            "companion_gpus": 4,
+            "total_gpus": 20,
+        }
 
     artifact = build_afd_qualification(_spec())
     assert artifact["deployment_plan"]["pools"]["companion"] is None
     assert artifact["deployment_plan"]["gpu_accounting"]["companion_gpus"] == 0
+
+
+def test_afd_plus_pd_qualification_rejects_inconsistent_companion() -> None:
+    spec = _spec(combined_with_pd=True, afd_phase="decode")
+    provenance = dict(spec.backend_deployment.parallel_config["afd_provenance"])
+    # Wrong: a decode-phase AFD pool pairs with a prefill companion.
+    provenance["companion_role"] = "decode"
+    parallel_config = {**spec.backend_deployment.parallel_config, "afd_provenance": provenance}
+    spec = replace(
+        spec,
+        backend_deployment=replace(spec.backend_deployment, parallel_config=parallel_config),
+    )
+    with pytest.raises(AFDQualificationError, match="companion_role"):
+        build_afd_qualification(spec)
 
 
 def test_qualification_rejects_unresolved_measurements() -> None:

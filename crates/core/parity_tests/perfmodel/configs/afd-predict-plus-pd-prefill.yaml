@@ -1,0 +1,33 @@
+# afd+pd prediction (AFD pool = prefill role, monolithic decode companion).
+#
+# Mirror of afd-predict-plus-pd-decode.yaml: the AFD pool serves prefill and
+# workers.decode is the monolithic decode companion (standard aic provider).
+
+traffic:
+  source: {type: synthetic, input_tokens: 1024, output_tokens: 128}
+  load:   {type: concurrency, concurrency: 8}
+  stop:   {requests: 32}
+
+engine:
+  mode: afd
+  model: Qwen/Qwen3-32B
+  hardware: h200_sxm          # node width 8
+  backend: sglang
+  backend_version: "0.5.14"
+  context_length: max
+  afd:
+    phase: prefill            # the AFD pool serves prefill
+    combined_with_pd: true
+    n_a_nodes: 1
+    n_f_nodes: 1
+    tp_a: 8
+    a_batch_size: 18
+    num_microbatches: 3
+    pipeline_model: full_overlap
+  workers:
+    decode:                   # monolithic decode companion (standard aic provider)
+      parallelism: {replicas: 1, tensor: 8, pipeline: 1, attention_data: 1, moe_tensor: 1, moe_expert: 1}
+      scheduler: {max_batched_tokens: 8192, max_sequences: 18}
+
+evaluation:
+  sla: {ttft_ms: 800, itl_ms: 30}

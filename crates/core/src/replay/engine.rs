@@ -580,3 +580,65 @@ mod belady_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod afd_role_tests {
+    use super::*;
+
+    /// The afd+pd decode role carries the AFD pool-pair topology as rank
+    /// metadata; its per-worker GPU accounting must report the A/F pool
+    /// total instead of the monolithic dp*tp product, while the monolithic
+    /// companion keeps the standard accounting.
+    #[test]
+    fn afd_role_factory_reports_pool_pair_gpu_total() {
+        let decode_rank: EngineConfig = serde_json::from_value(serde_json::json!({
+            "backend": "sglang",
+            "block_size": 1,
+            "num_gpu_blocks": 1024,
+            "worker_type": "decode",
+            "afd": {
+                "a_pool": {"system": "h200_sxm", "tp_a": 8, "n_a_nodes": 1, "a_batch_size": 18},
+                "f_pool": {"system": "h200_sxm", "f_moe_ep_size": 1, "n_f_nodes": 2},
+                "phase": "decode",
+                "gpus_per_node": 8,
+                "num_microbatches": 3,
+                "pipeline_model": "full_overlap",
+                "comm_overhead_factor": 1.0,
+                "boundary_on_attn": true,
+            },
+        }))
+        .unwrap();
+        let prefill_rank: EngineConfig = serde_json::from_value(serde_json::json!({
+            "backend": "sglang",
+            "block_size": 1,
+            "num_gpu_blocks": 1024,
+            "worker_type": "prefill",
+        }))
+        .unwrap();
+        let config = ReplayEngineConfig {
+            rank: EngineConfig::default(),
+            prefill: Some(ReplayRoleConfig {
+                dp_size: 1,
+                tensor_parallel_size: 1,
+                num_gpu_blocks_is_explicit: None,
+                rank: prefill_rank,
+            }),
+            decode: Some(ReplayRoleConfig {
+                dp_size: 1,
+                tensor_parallel_size: 1,
+                num_gpu_blocks_is_explicit: None,
+                rank: decode_rank,
+            }),
+            ..Default::default()
+        };
+        let factory = ReplayEngineFactory::new();
+        let decode_factory = factory
+            .role_factory(&config, WorkerStage::Decode, false)
+            .unwrap();
+        assert_eq!(decode_factory.gpus_per_worker().unwrap(), 24);
+        let prefill_factory = factory
+            .role_factory(&config, WorkerStage::Prefill, false)
+            .unwrap();
+        assert_eq!(prefill_factory.gpus_per_worker().unwrap(), 1);
+    }
+}

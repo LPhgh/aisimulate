@@ -1,0 +1,33 @@
+# Pure AFD + chunked prefill (SGLang native chunking; opts out of the pinned
+# single-pass window).
+#
+# engine.afd.chunked_prefill_size=256 < isl=1024 splits every prompt into 4
+# chunks; each prefill pass is priced by the aic-afd provider at its actual
+# (chunk tokens, prefix) geometry (attention grows with the real prefix, the
+# F pool tracks chunk tokens), and TTFT completes at the last chunk.
+
+traffic:
+  source: {type: synthetic, input_tokens: 1024, output_tokens: 128}
+  load:   {type: concurrency, concurrency: 8}
+  stop:   {requests: 32}
+
+engine:
+  mode: afd
+  model: Qwen/Qwen3-32B
+  hardware: h200_sxm          # node width 8
+  backend: sglang
+  backend_version: "0.5.14"
+  context_length: max
+  afd:
+    phase: both               # pure AFD must be both
+    combined_with_pd: false   # no companion
+    n_a_nodes: 1
+    n_f_nodes: 1
+    tp_a: 8
+    a_batch_size: 18
+    num_microbatches: 3
+    pipeline_model: full_overlap
+    chunked_prefill_size: 256
+
+evaluation:
+  sla: {ttft_ms: 800, itl_ms: 30}

@@ -8,11 +8,11 @@
 //!
 //! - `comm_overhead_factor` multiplies the two transfer terms HERE, exactly
 //!   once; the measurement side (`AfdForwardPassPerfModel`) keeps 1.0.
-//! - The serial/conservative/optimistic cycle/fill/step formulas are
-//!   carried over term by term, including the `num_microbatches == 1`
-//!   serial rule (mirrored on the measurement side by
-//!   `AfdForwardPassPerfModel::pipeline_tcycle`) and the optimistic ->
-//!   conservative degradation with its effective-model tracking.
+//! - The no_overlap/partial_overlap/full_overlap cycle/fill/step formulas
+//!   stay term-for-term identical to the measurement side
+//!   (`AfdForwardPassPerfModel::pipeline_tcycle`), including the
+//!   `num_microbatches == 1` no_overlap rule and the full_overlap ->
+//!   partial_overlap degradation with its effective-model tracking.
 
 use crate::common::error::AicError;
 use crate::perfmodel::afd::model::{AfdLayerTimes, AfdPipelineModel};
@@ -216,7 +216,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_optimistic_holds_when_microbatches_fill_pipeline() {
+    fn decode_full_overlap_holds_when_microbatches_fill_pipeline() {
         let eval = evaluate_afd_phase(
             &pure_knobs(),
             &golden_decode_times(),
@@ -225,7 +225,7 @@ mod tests {
             128,
         )
         .expect("decode eval");
-        // min_m = 2 + 0.0224576 / 0.0612677 = 2.3665 < 3 -> optimistic holds;
+        // min_m = 2 + 0.0224576 / 0.0612677 = 2.3665 < 3 -> full_overlap holds;
         // cycle = t_a; step = fill + t_a * 191.
         assert_eq!(eval.effective_pipeline_model, AfdPipelineModel::FullOverlap);
         assert!(eval.communication_hidden);
@@ -238,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn prefill_optimistic_degrades_to_conservative() {
+    fn prefill_full_overlap_degrades_to_partial_overlap() {
         let eval = evaluate_afd_phase(
             &pure_knobs(),
             &golden_prefill_times(),
@@ -247,7 +247,7 @@ mod tests {
             128,
         )
         .expect("prefill eval");
-        // min_m = 2 + 2.5365824 / 0.9215771 = 4.7525 > 3 -> conservative;
+        // min_m = 2 + 2.5365824 / 0.9215771 = 4.7525 > 3 -> partial_overlap;
         // cycle = max(t_a + a2f, t_f + f2a) = t_f + f2a; step = fill + cycle * 191.
         assert_eq!(
             eval.effective_pipeline_model,
@@ -262,7 +262,7 @@ mod tests {
     }
 
     #[test]
-    fn serial_and_single_microbatch_use_serial_cadence() {
+    fn no_overlap_and_single_microbatch_use_sequential_cadence() {
         let knobs = AfdPipelineKnobs {
             pipeline_model: AfdPipelineModel::NoOverlap,
             ..pure_knobs()
@@ -280,7 +280,8 @@ mod tests {
         assert!((eval.step_latency_ms - step).abs() < 1e-12 * step);
         assert_eq!(eval.effective_pipeline_model, AfdPipelineModel::NoOverlap);
 
-        // num_microbatches == 1 forces serial even under optimistic request.
+        // num_microbatches == 1 forces the sequential cadence even under a
+        // full_overlap request.
         let one_ub = AfdPipelineKnobs {
             num_microbatches: 1,
             ..pure_knobs()
