@@ -25,6 +25,8 @@ pub(crate) use host_offload::{
 pub use belady::KvEvictionPolicy;
 pub use common::running_mean::RunningMean;
 pub use common::speculative::normalize_conditional_accept_rates;
+pub(crate) use config::afd_total_gpus;
+pub use config::{AfdEngineConfig, AfdPoolPhase};
 pub use config::{
     Backend, EngineConfig, G3OffloadConfig, G3Scope, NativeHostOffloadConfig, PreemptionMode,
     SglangConfig, SglangSchedulePolicy, StateCacheConfig, TrtllmCapacityPolicy, TrtllmConfig,
@@ -40,6 +42,8 @@ pub use protocol::{
 };
 pub use runtime::{Engine, EngineFactory};
 pub use scheduler::SchedulerRank;
+#[cfg(feature = "python")]
+pub(crate) use scheduler::afd::timing::AfdTimingModel;
 #[cfg(feature = "python")]
 pub(crate) use timing::{TimingEvidenceAccumulator, ValidatedTimingPhase};
 pub use timing::{

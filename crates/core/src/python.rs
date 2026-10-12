@@ -7,10 +7,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::engine::{
-    Backend, EngineConfig, TimingEvidenceAccumulator, TimingEvidenceSource, TimingEvidenceSummary,
-    TimingModel, TimingModelConfig, TimingOperationEvidence, TimingPhaseEvidence,
-    ValidatedTimingPhase,
+    AfdTimingModel, Backend, EngineConfig, TimingEvidenceAccumulator, TimingEvidenceSource,
+    TimingEvidenceSummary, TimingModel, TimingModelConfig, TimingOperationEvidence,
+    TimingPhaseEvidence, ValidatedTimingPhase,
 };
+use crate::perfmodel::afd::model::{AfdForwardPassPerfModel, AfdTimingConfig};
 use crate::perfmodel::engine::{Engine as PerfEngine, RuntimeConfig};
 use crate::replay::{
     POWER_DATA_COVERAGE_THRESHOLD, ReplayArtifactKvEventVisibility, ReplayArtifacts,
@@ -931,9 +932,44 @@ fn resolve_role_timing(
     let TimingModelConfig::External { provider, config } = role.rank.timing_model.clone() else {
         return Ok(None);
     };
+    if provider == "aic-afd" {
+        // The AFD role's rank config carries the afd pool topology as pure
+        // metadata; this branch materializes the per-pool timing model.
+        // KV capacity is NOT estimated here (the aic materialize/cap helpers
+        // are monolithic-only): the rank runs on the monolithic backend core
+        // with a capacity derived to keep max_num_seqs the binding admission
+        // limit, and physical feasibility is enforced by the per-pool memory
+        // gate below (runtime retraction is only an anomaly backstop).
+        let wire: AfdTimingConfig = serde_json::from_value(config)
+            .context("invalid aic-afd timing provider configuration")?;
+        // The timing config's nextn prices the verify width (cost side); the
+        // rank's aic_nextn builds the scheduling core's burst sampler
+        // (benefit side). The two must agree — a mismatch silently models
+        // MTP cost without the token benefit (or vice versa). Mirrors
+        // materialize_aic_capacity.
+        let engine_nextn = role.rank.aic_nextn.unwrap_or(0);
+        ensure!(
+            wire.nextn as usize == engine_nextn,
+            "aic-afd timing nextn={} does not match engine aic_nextn={engine_nextn}",
+            wire.nextn,
+        );
+        let (isl, osl) = (wire.isl, wire.osl);
+        let perf_config = wire
+            .into_perf_config()
+            .context("invalid aic-afd timing provider configuration")?;
+        let perf = AfdForwardPassPerfModel::build(perf_config)
+            .context("failed to build the aic-afd per-pool perf model")?;
+        check_afd_memory_fit_py(&wire, &perf, role.rank.afd.as_ref())?;
+        return Ok(Some(Arc::new(AfdTimingModel::with_decode_identity(
+            perf,
+            isl,
+            osl,
+            wire.frozen_decode_identity,
+        ))));
+    }
     ensure!(
         provider == "aic",
-        "native timing provider {provider:?} is not installed; only \"aic\" is \
+        "native timing provider {provider:?} is not installed; only \"aic\" and \"aic-afd\" are \
          available in the AISimulate runtime"
     );
     let mut config: AicTimingConfig =
@@ -974,6 +1010,77 @@ fn resolve_role_timing(
         config: resolved,
     };
     Ok(Some(Arc::new(timing)))
+}
+
+/// Native per-pool AFD memory-feasibility gate: the shared backend memory
+/// model computes activations/KV/NCCL/other per pool and the caller adds the
+/// Rust partition weight sums (`Op::weight_bytes`). Runs at provider
+/// construction so infeasible candidates fail at replay start.
+#[cfg(feature = "python")]
+fn check_afd_memory_fit_py(
+    config: &AfdTimingConfig,
+    perf: &AfdForwardPassPerfModel,
+    afd: Option<&crate::engine::AfdEngineConfig>,
+) -> Result<()> {
+    use pyo3::types::PyDict;
+    let phase = match afd.map(|afd| afd.phase) {
+        Some(crate::engine::AfdPoolPhase::Prefill) => "prefill",
+        Some(crate::engine::AfdPoolPhase::Decode) => "decode",
+        _ => "both",
+    };
+    Python::with_gil(|py| {
+        let module = py.import("aisimulate.sdk.afd_memory")?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("model_path", &config.model)?;
+        kwargs.set_item("backend_name", config.backend.as_str())?;
+        kwargs.set_item("backend_version", config.backend_version.clone())?;
+        kwargs.set_item("isl", config.isl)?;
+        kwargs.set_item("osl", config.osl)?;
+        kwargs.set_item("prefix", 0)?;
+        kwargs.set_item("nextn", config.nextn)?;
+        let a_pool = PyDict::new(py);
+        a_pool.set_item("system", &config.a_pool.system)?;
+        a_pool.set_item("tp_a", config.a_pool.tp_a)?;
+        a_pool.set_item("n_a_nodes", config.a_pool.n_a_nodes)?;
+        kwargs.set_item("a_pool", a_pool)?;
+        let f_pool = PyDict::new(py);
+        f_pool.set_item("system", &config.f_pool.system)?;
+        f_pool.set_item("f_moe_ep_size", config.f_pool.f_moe_ep_size)?;
+        f_pool.set_item("n_f_nodes", config.f_pool.n_f_nodes)?;
+        kwargs.set_item("f_pool", f_pool)?;
+        kwargs.set_item("gpus_per_node", config.gpus_per_node)?;
+        kwargs.set_item("a_batch_size", config.a_pool.a_batch_size)?;
+        kwargs.set_item("num_microbatches", config.num_microbatches)?;
+        // Per-phase partition weights: each phase's memory dict sums that
+        // phase's own op-list partition.
+        let phase_weights = |a_pool_side: bool| -> std::result::Result<_, pyo3::PyErr> {
+            let weights = PyDict::new(py);
+            weights.set_item(
+                "prefill",
+                perf.pool_partition_weight_gb(
+                    a_pool_side,
+                    crate::perfmodel::afd::model::AfdPhase::Prefill,
+                ),
+            )?;
+            weights.set_item(
+                "decode",
+                perf.pool_partition_weight_gb(
+                    a_pool_side,
+                    crate::perfmodel::afd::model::AfdPhase::Decode,
+                ),
+            )?;
+            Ok(weights)
+        };
+        kwargs.set_item("max_seq_len", config.max_seq_len)?;
+        kwargs.set_item("a_weight_gb", phase_weights(true)?)?;
+        kwargs.set_item("f_weight_gb", phase_weights(false)?)?;
+        kwargs.set_item("phase", phase)?;
+        module
+            .getattr("check_afd_memory_fit")?
+            .call((), Some(&kwargs))?;
+        Ok::<_, pyo3::PyErr>(())
+    })
+    .map_err(|error| anyhow::anyhow!("AFD memory-feasibility check failed: {error}"))
 }
 
 fn runtime_paths(traffic: &RuntimeTraffic) -> Result<Vec<PathBuf>> {

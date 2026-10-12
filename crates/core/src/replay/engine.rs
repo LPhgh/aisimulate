@@ -208,6 +208,9 @@ pub struct ReplayRoleFactory {
     tensor_parallel_size: u32,
     backend: Backend,
     total_blocks: u64,
+    /// AFD pool GPU total (`(n_a_nodes + n_f_nodes) * gpus_per_node`),
+    /// overriding the monolithic `dp * tp` accounting.
+    afd_total_gpus: Option<usize>,
     pub(crate) g3_config: Option<crate::engine::G3OffloadConfig>,
     pub(crate) g3_block_bytes: usize,
     pub(crate) g3_tier: Option<crate::engine::g3_offload::SharedG3Tier>,
@@ -270,6 +273,9 @@ impl ReplayRoleFactory {
 
     #[doc(hidden)]
     pub fn gpus_per_worker(&self) -> ReplayResult<usize> {
+        if let Some(total) = self.afd_total_gpus {
+            return Ok(total);
+        }
         usize::try_from(self.dp_size.get())
             .ok()
             .and_then(|dp| {
@@ -355,6 +361,10 @@ impl ReplayEngineFactory {
             ReplayError::InvalidSpec("engine KV block count exceeds the metrics range".into())
         })?;
         role.rank.validate().map_err(engine_error)?;
+        let afd_total_gpus =
+            role.rank.afd.as_ref().map(|afd| {
+                crate::engine::afd_total_gpus(&afd.a_pool, &afd.f_pool, afd.gpus_per_node)
+            });
         let g3_config = role.rank.g3_offload.take();
         let g3_block_bytes = role
             .rank
@@ -373,6 +383,7 @@ impl ReplayEngineFactory {
             tensor_parallel_size: role.tensor_parallel_size,
             backend,
             total_blocks,
+            afd_total_gpus,
             g3_config,
             g3_block_bytes,
             g3_tier: None,

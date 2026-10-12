@@ -94,6 +94,129 @@ pub enum Backend {
     Trtllm,
 }
 
+/// The AFD pool's phase within the deployment (afd+pd): pure AFD serves
+/// both phases in one pool; a disaggregated AFD
+/// role serves exactly one, with the opposite phase on a monolithic
+/// companion pool.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AfdPoolPhase {
+    /// Pure AFD: the pool runs prefill AND decode for every batch.
+    #[default]
+    Both,
+    /// afd+pd with the AFD pool as the prefill role (decode companion).
+    Prefill,
+    /// afd+pd with the AFD pool as the decode role (prefill companion).
+    Decode,
+}
+
+/// AFD A-pool (attention) topology identity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AfdAPoolConfig {
+    /// Perf-DB system of the A pool (heterogeneous AFD pairs it with a
+    /// different F-pool system; homogeneous runs repeat the top-level system).
+    pub system: String,
+    /// A-worker tensor parallelism; must divide the node width.
+    pub tp_a: u32,
+    /// Number of A (attention) nodes.
+    pub n_a_nodes: u32,
+    /// In-flight batch per A-worker.
+    pub a_batch_size: u32,
+}
+
+/// AFD F-pool (FFN/MoE) topology identity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AfdFPoolConfig {
+    /// Perf-DB system of the F pool.
+    pub system: String,
+    /// Expert parallelism of the FFN/MoE pool; must divide
+    /// `n_f_nodes * gpus_per_node`.
+    pub f_moe_ep_size: u32,
+    /// Number of F (FFN/MoE) nodes.
+    pub n_f_nodes: u32,
+}
+
+/// Total GPUs of the AFD pool pair (`(n_a_nodes + n_f_nodes) *
+/// gpus_per_node`) — the replay report's per-worker GPU accounting.
+pub(crate) fn afd_total_gpus(
+    a_pool: &AfdAPoolConfig,
+    f_pool: &AfdFPoolConfig,
+    gpus_per_node: u32,
+) -> usize {
+    (a_pool.n_a_nodes as usize + f_pool.n_f_nodes as usize) * gpus_per_node as usize
+}
+
+/// AFD scheduling-core configuration. Mirrors the Python
+/// `AFDTopology` scheduling knobs; perf-backend stays on [`EngineConfig::backend`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AfdEngineConfig {
+    pub a_pool: AfdAPoolConfig,
+    pub f_pool: AfdFPoolConfig,
+    /// The pool's phase: `both` for pure AFD (default), a single phase for
+    /// a disaggregated afd+pd role.
+    #[serde(default)]
+    pub phase: AfdPoolPhase,
+    /// Node width both pools were enumerated against; validated against each
+    /// pool's perf-DB system spec by the timing provider.
+    pub gpus_per_node: u32,
+    /// In-flight pipeline microbatches.
+    pub num_microbatches: u32,
+    /// Pipeline cadence model (serial / conservative / optimistic with the
+    /// min-microbatch degradation rule).
+    pub pipeline_model: crate::perfmodel::afd::model::AfdPipelineModel,
+    /// Applied exactly once, at pipeline evaluation, on the transfer terms;
+    /// the measurement side stays 1.0.
+    pub comm_overhead_factor: f64,
+    /// Assign boundary ops (add_norm_2 / logits_gemm) to the A pool when
+    /// true, to the F pool otherwise.
+    pub boundary_on_attn: bool,
+}
+
+impl AfdEngineConfig {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.a_pool.tp_a >= 1 && self.a_pool.n_a_nodes >= 1 && self.a_pool.a_batch_size >= 1,
+            "afd a_pool tp_a / n_a_nodes / a_batch_size must be positive integers"
+        );
+        ensure!(
+            self.f_pool.n_f_nodes >= 1 && self.f_pool.f_moe_ep_size >= 1,
+            "afd f_pool n_f_nodes / f_moe_ep_size must be positive integers"
+        );
+        ensure!(
+            self.gpus_per_node >= 1 && self.gpus_per_node % self.a_pool.tp_a == 0,
+            "afd gpus_per_node must be a positive multiple of tp_a"
+        );
+        ensure!(
+            self.num_microbatches >= 1,
+            "afd num_microbatches must be a positive integer"
+        );
+        ensure!(
+            self.num_microbatches <= self.a_pool.a_batch_size,
+            "afd num_microbatches ({}) cannot exceed a_batch_size ({}): a microbatch would hold \
+             no sequences, and the pipeline would charge {} microbatch-layers per step for {} \
+             in-flight sequences per worker",
+            self.num_microbatches,
+            self.a_pool.a_batch_size,
+            self.num_microbatches,
+            self.a_pool.a_batch_size
+        );
+        ensure!(
+            self.comm_overhead_factor.is_finite() && self.comm_overhead_factor > 0.0,
+            "afd comm_overhead_factor must be a positive finite number"
+        );
+        ensure!(
+            self.phase == AfdPoolPhase::Both,
+            "afd phase={:?} requires the two-pool afd+pd handoff, which the continuous \
+             SglangCore AFD path does not implement yet; use phase=both",
+            self.phase
+        );
+        Ok(())
+    }
+}
+
 impl Backend {
     /// Backend-native KV block size used when a caller does not provide one.
     pub const fn default_block_size(self) -> usize {
@@ -451,6 +574,11 @@ pub struct EngineConfig {
     pub sglang: SglangConfig,
     /// TensorRT-LLM-only scheduler controls.
     pub trtllm: TrtllmConfig,
+    /// AFD pool-pair topology metadata for `"aic-afd"` provider ranks: replay
+    /// GPU accounting and the memory gate's phase. Not a scheduling-core
+    /// switch — AFD ranks run on the monolithic backend core with the AFD
+    /// timing model injected.
+    pub afd: Option<AfdEngineConfig>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -520,6 +648,8 @@ struct EngineConfigWire {
     sglang: SglangConfig,
     #[serde(default)]
     trtllm: TrtllmConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    afd: Option<AfdEngineConfig>,
 }
 
 impl<'de> Deserialize<'de> for EngineConfig {
@@ -572,6 +702,7 @@ impl<'de> Deserialize<'de> for EngineConfig {
             timing_model: wire.timing_model,
             sglang: wire.sglang,
             trtllm: wire.trtllm,
+            afd: wire.afd,
         };
         config
             .validate_state_cache()
@@ -613,6 +744,7 @@ impl Default for EngineConfig {
             timing_model: TimingModelConfig::Polynomial,
             sglang: SglangConfig::default(),
             trtllm: TrtllmConfig::default(),
+            afd: None,
         }
     }
 }
@@ -692,6 +824,9 @@ impl EngineConfig {
 
     pub(crate) fn validate(&self) -> Result<()> {
         self.validate_state_cache()?;
+        if let Some(afd) = &self.afd {
+            afd.validate()?;
+        }
         ensure!(self.num_gpu_blocks > 0, "num_gpu_blocks must be positive");
         ensure!(self.block_size > 0, "block_size must be positive");
         if matches!(self.backend, Backend::Vllm | Backend::Trtllm) {
@@ -856,6 +991,140 @@ impl EngineConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_afd_config() -> AfdEngineConfig {
+        AfdEngineConfig {
+            a_pool: AfdAPoolConfig {
+                system: "h200_sxm".into(),
+                tp_a: 8,
+                n_a_nodes: 1,
+                a_batch_size: 18,
+            },
+            f_pool: AfdFPoolConfig {
+                system: "b200_sxm".into(),
+                f_moe_ep_size: 1,
+                n_f_nodes: 1,
+            },
+            phase: AfdPoolPhase::Both,
+            gpus_per_node: 8,
+            num_microbatches: 3,
+            pipeline_model: crate::perfmodel::afd::model::AfdPipelineModel::FullOverlap,
+            comm_overhead_factor: 1.0,
+            boundary_on_attn: true,
+        }
+    }
+
+    #[test]
+    fn monolithic_defaults_round_trip_and_legacy_engine_core_fails_loud() {
+        let config = EngineConfig::default();
+        assert!(config.afd.is_none());
+        config.validate().expect("default config validates");
+        // Legacy payloads without the afd metadata deserialize identically.
+        let legacy = serde_json::json!({
+            "backend": "vllm",
+            "num_gpu_blocks": 1024,
+            "block_size": 64,
+        });
+        let decoded: EngineConfig = serde_json::from_value(legacy).expect("legacy decode");
+        assert!(decoded.afd.is_none());
+        // Retired batch-locked AFD wires carry engine_core:"afd"; the field no
+        // longer exists, so the old configuration fails loudly instead of
+        // silently degrading to a monolithic run.
+        let retired = serde_json::json!({
+            "backend": "sglang",
+            "num_gpu_blocks": 1024,
+            "block_size": 1,
+            "engine_core": "afd",
+        });
+        let error = serde_json::from_value::<EngineConfig>(retired)
+            .expect_err("engine_core wires must fail loud");
+        assert!(error.to_string().contains("engine_core"));
+    }
+
+    #[test]
+    fn afd_config_round_trips_and_validates() {
+        let json = serde_json::json!({
+            "backend": "sglang",
+            "num_gpu_blocks": 1024,
+            "block_size": 1,
+            "afd": {
+                "a_pool": {"system": "h200_sxm", "tp_a": 8, "n_a_nodes": 1, "a_batch_size": 18},
+                "f_pool": {"system": "b200_sxm", "f_moe_ep_size": 1, "n_f_nodes": 1},
+                "gpus_per_node": 8,
+                "num_microbatches": 3,
+                "pipeline_model": "optimistic",
+                "comm_overhead_factor": 1.0,
+                "boundary_on_attn": true,
+            },
+        });
+        let config: EngineConfig = serde_json::from_value(json).expect("afd decode");
+        assert_eq!(config.afd.as_ref(), Some(&sample_afd_config()));
+        config.validate().expect("afd metadata validates");
+        let serialized = serde_json::to_value(&config).expect("serialize");
+        let reparsed: EngineConfig = serde_json::from_value(serialized).expect("reparse");
+        assert_eq!(reparsed, config);
+    }
+
+    #[test]
+    fn afd_config_field_validation() {
+        let mut afd = sample_afd_config();
+        afd.num_microbatches = 0;
+        assert!(afd.validate().is_err());
+        let mut afd = sample_afd_config();
+        afd.comm_overhead_factor = 0.0;
+        assert!(afd.validate().is_err());
+        let mut afd = sample_afd_config();
+        afd.a_pool.tp_a = 0;
+        assert!(afd.validate().is_err());
+    }
+
+    /// A pipeline deeper than the per-worker batch would price `m * L`
+    /// microbatch-layers per step for fewer than `m` in-flight sequences per
+    /// worker, so the degenerate band is rejected at the wire instead of being
+    /// absorbed by the geometry clamp.
+    #[test]
+    fn afd_config_rejects_microbatch_depth_above_batch_size() {
+        let mut afd = sample_afd_config();
+        afd.num_microbatches = afd.a_pool.a_batch_size + 1;
+        let error = afd.validate().expect_err("depth above a_batch_size");
+        assert!(
+            error.to_string().contains("cannot exceed a_batch_size"),
+            "{error}"
+        );
+        // The boundary itself is legal: one sequence per microbatch.
+        let mut afd = sample_afd_config();
+        afd.num_microbatches = afd.a_pool.a_batch_size;
+        afd.validate().expect("depth == a_batch_size validates");
+    }
+
+    /// Single-phase AFD roles only make sense with the two-pool afd+pd
+    /// handoff, which the continuous SglangCore path does not implement.
+    #[test]
+    fn afd_wire_rejects_single_phase_until_the_two_pool_handoff_lands() {
+        for phase in ["prefill", "decode"] {
+            let json = serde_json::json!({
+                "backend": "sglang",
+                "num_gpu_blocks": 1024,
+                "block_size": 1,
+                "afd": {
+                    "a_pool": {"system": "h200_sxm", "tp_a": 8, "n_a_nodes": 1, "a_batch_size": 18},
+                    "f_pool": {"system": "b200_sxm", "f_moe_ep_size": 1, "n_f_nodes": 1},
+                    "phase": phase,
+                    "gpus_per_node": 8,
+                    "num_microbatches": 3,
+                    "pipeline_model": "optimistic",
+                    "comm_overhead_factor": 1.0,
+                    "boundary_on_attn": true,
+                },
+            });
+            let config: EngineConfig = serde_json::from_value(json).expect("afd wire decode");
+            let error = config.validate().expect_err("single-phase afd wire");
+            assert!(
+                error.to_string().contains("two-pool afd+pd handoff"),
+                "phase={phase}: {error}"
+            );
+        }
+    }
 
     type InvalidHostConfigCase = (fn(&mut EngineConfig), &'static str);
 

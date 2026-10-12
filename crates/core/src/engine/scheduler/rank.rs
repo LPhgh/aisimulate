@@ -79,9 +79,6 @@ impl SchedulerRank {
             "native_host_offload supports only dp_size=1 in the initial implementation"
         );
         let mut args = core_args(config, timing);
-        if config.backend == Backend::Sglang {
-            normalize_sglang_attention_dp(&mut args, identity.dp_size.get())?;
-        }
         let capture_kv_events = config.emit_kv_events;
         let core = match config.backend {
             Backend::Vllm | Backend::Trtllm => EngineCore::Vllm(VllmCore::new_with_worker_rank(
@@ -91,13 +88,16 @@ impl SchedulerRank {
                 seed_offset,
                 capture_kv_events,
             )),
-            Backend::Sglang => EngineCore::Sglang(SglangCore::new_with_worker_rank(
-                args,
-                identity.worker_id,
-                identity.dp_rank,
-                seed_offset,
-                capture_kv_events,
-            )),
+            Backend::Sglang => {
+                normalize_sglang_attention_dp(&mut args, identity.dp_size.get())?;
+                EngineCore::Sglang(SglangCore::new_with_worker_rank(
+                    args,
+                    identity.worker_id,
+                    identity.dp_rank,
+                    seed_offset,
+                    capture_kv_events,
+                ))
+            }
         };
         Ok(Self {
             core,
