@@ -259,7 +259,7 @@ def _afd_deployment(engine: EnginePredictionConfig) -> BackendDeploymentSpec:
             f"f_system={f_system!r} ({f_facts.gpus_per_node})"
         )
     topology = AFDTopology(
-        **afd.model_dump(mode="python", exclude={"a_system", "f_system"}),
+        **afd.model_dump(mode="python", exclude={"a_system", "f_system", "pipeline_fill_mode"}),
         gpus_per_node=facts.gpus_per_node,
         is_moe=facts.is_moe,
         num_experts=facts.num_experts,
@@ -285,7 +285,10 @@ def _afd_deployment(engine: EnginePredictionConfig) -> BackendDeploymentSpec:
         )
     afd_parallel = AFDParallelConfig(topology=topology, companion=companion)
     parallel_config: dict[str, JSONValue] = {
-        "afd": topology.provenance()["topology"],
+        "afd": {
+            **topology.provenance()["topology"],
+            **({"pipeline_fill_mode": afd.pipeline_fill_mode} if afd.pipeline_fill_mode != "per_pass" else {}),
+        },
         "afd_provenance": afd_parallel.provenance(),
     }
     performance_metadata: dict[str, dict[str, JSONValue]] = {

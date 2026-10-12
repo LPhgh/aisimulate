@@ -22,13 +22,15 @@ use std::sync::Mutex;
 
 use anyhow::Result;
 
-use crate::engine::scheduler::afd::pipeline::{AfdEvalPhase, AfdPipelineKnobs, evaluate_afd_phase};
+use crate::engine::scheduler::afd::pipeline::{
+    AfdEvalPhase, AfdPipelineKnobs, evaluate_afd_phase, evaluate_afd_phase_with_fill,
+};
 #[cfg(feature = "python")]
 use crate::engine::timing::{
     TimingEvidenceAccumulator, TimingEvidenceSource, TimingOperationEvidence, ValidatedTimingPhase,
 };
 use crate::engine::timing::{TimingEvidenceSummary, TimingModel};
-use crate::perfmodel::afd::model::{AfdForwardPassPerfModel, AfdPhase};
+use crate::perfmodel::afd::model::{AfdForwardPassPerfModel, AfdPhase, AfdPipelineFillMode};
 
 /// Replay timing provider for AFD ranks.
 pub struct AfdTimingModel {
@@ -39,7 +41,15 @@ pub struct AfdTimingModel {
     /// Island-frozen decode identity (fixed synthetic workloads); trace and
     /// agentic workloads use the instantaneous per-pass evaluation.
     frozen_decode_identity: bool,
+    /// Pipeline fill charging policy. `per_pass` pays the fill on
+    /// every pass; `amortized` charges it only where the pipeline cannot be
+    /// in steady state (see `fill_charged` and the instantaneous clamp).
+    fill_mode: AfdPipelineFillMode,
     decode_step_ms: Mutex<Option<f64>>,
+    /// Frozen-identity amortized-fill wave state: the pipeline fill is
+    /// charged on the first decode pass (pipeline startup) and not again —
+    /// the steady-flow caliber this mode prices.
+    fill_charged: Mutex<bool>,
     /// Power evidence accumulator: per-op energy from the two
     /// pool engines flows into the standard replay power statistics.
     #[cfg(feature = "python")]
@@ -52,12 +62,13 @@ pub struct AfdTimingModel {
 }
 
 impl AfdTimingModel {
-    /// Full constructor with the decode-identity choice.
-    pub fn with_decode_identity(
+    /// Full constructor with the decode-identity and fill-mode choices.
+    pub fn with_fill_mode(
         perf: AfdForwardPassPerfModel,
         isl: u32,
         osl: u32,
         frozen: bool,
+        fill_mode: AfdPipelineFillMode,
     ) -> Self {
         let config = perf.config();
         let n_a_workers =
@@ -76,7 +87,9 @@ impl AfdTimingModel {
             isl,
             osl,
             frozen_decode_identity: frozen,
+            fill_mode,
             decode_step_ms: Mutex::new(None),
+            fill_charged: Mutex::new(false),
             #[cfg(feature = "python")]
             evidence: Mutex::new(TimingEvidenceAccumulator::default()),
             #[cfg(feature = "python")]
@@ -190,12 +203,20 @@ impl TimingModel for AfdTimingModel {
                 num_microbatches: m_eff,
                 ..self.knobs
             };
-            let evaluation = evaluate_afd_phase(
+            // Amortized fill: a pass at the configured pipeline depth
+            // is steady-state and pays cycle terms only; a shallower pass is
+            // a pipeline boundary and pays the fill in full.
+            let charge_fill = match self.fill_mode {
+                AfdPipelineFillMode::PerPass => true,
+                AfdPipelineFillMode::Amortized => m_eff < self.knobs.num_microbatches,
+            };
+            let evaluation = evaluate_afd_phase_with_fill(
                 &knobs,
                 &metrics.layer_times,
                 AfdEvalPhase::Decode,
                 self.isl,
                 self.osl,
+                charge_fill,
             )?;
             #[cfg(feature = "python")]
             // Evidence belongs to the same workload point the prediction
@@ -215,6 +236,39 @@ impl TimingModel for AfdTimingModel {
         let metrics = self
             .perf
             .predict_phase_metrics(AfdPhase::Decode, self.isl, self.osl, 0)?;
+        if self.fill_mode == AfdPipelineFillMode::Amortized {
+            // Amortized fill: the pipeline fill is charged once, on
+            // the first decode pass (startup); steady passes pay cycle terms
+            // only. The cached step is the steady-state one.
+            let first = evaluate_afd_phase_with_fill(
+                &self.knobs,
+                &metrics.layer_times,
+                AfdEvalPhase::Decode,
+                self.isl,
+                self.osl,
+                true,
+            )?;
+            let steady = evaluate_afd_phase_with_fill(
+                &self.knobs,
+                &metrics.layer_times,
+                AfdEvalPhase::Decode,
+                self.isl,
+                self.osl,
+                false,
+            )?;
+            *self.decode_step_ms.lock().expect("decode cache poisoned") =
+                Some(steady.step_latency_ms);
+            let mut charged = self.fill_charged.lock().expect("fill state poisoned");
+            let step = if *charged {
+                steady.step_latency_ms
+            } else {
+                *charged = true;
+                first.step_latency_ms
+            };
+            #[cfg(feature = "python")]
+            self.record_phase_evidence(false, self.isl, 0)?;
+            return Ok(step);
+        }
         let evaluation = evaluate_afd_phase(
             &self.knobs,
             &metrics.layer_times,
@@ -295,6 +349,20 @@ mod tests {
         num_microbatches: u32,
         frozen: bool,
     ) -> AfdTimingModel {
+        provider_for_fill(n_a_nodes, a_batch_size, num_microbatches, frozen, AfdPipelineFillMode::PerPass)
+    }
+
+    fn provider_with_fill(frozen: bool, fill_mode: AfdPipelineFillMode) -> AfdTimingModel {
+        provider_for_fill(1, 18, 3, frozen, fill_mode)
+    }
+
+    fn provider_for_fill(
+        n_a_nodes: u32,
+        a_batch_size: u32,
+        num_microbatches: u32,
+        frozen: bool,
+        fill_mode: AfdPipelineFillMode,
+    ) -> AfdTimingModel {
         let db = Arc::new(
             PerfDatabase::load(&systems_root(), "h200_sxm", "trtllm", "1.3.0rc20")
                 .expect("load db"),
@@ -332,11 +400,79 @@ mod tests {
         };
         let perf = AfdForwardPassPerfModel::from_engines(config, a_engine, f_engine)
             .expect("afd perf model");
-        AfdTimingModel::with_decode_identity(perf, 1024, 128, frozen)
+        AfdTimingModel::with_fill_mode(perf, 1024, 128, frozen, fill_mode)
     }
 
     fn frozen_provider() -> AfdTimingModel {
         provider(true)
+    }
+
+    /// Frozen amortized fill: the first decode pass pays the pipeline
+    /// fill (startup); every later pass pays cycle terms only.
+    #[test]
+    fn amortized_fill_charges_startup_once_for_the_frozen_identity() {
+        let timing = provider_with_fill(true, AfdPipelineFillMode::Amortized);
+        let first = timing
+            .predict_decode_ms(8, 8 * 1024, 1024, 1 << 20)
+            .expect("first decode");
+        let steady = timing
+            .predict_decode_ms(8, 8 * 1024, 1024, 1 << 20)
+            .expect("steady decode");
+        let steady_again = timing
+            .predict_decode_ms(4, 4 * 1024, 1024, 1 << 20)
+            .expect("steady decode again");
+
+        let metrics = timing
+            .perf
+            .predict_phase_metrics(AfdPhase::Decode, 1024, 128, 0)
+            .expect("metrics");
+        let with_fill = evaluate_afd_phase_with_fill(
+            &timing.knobs,
+            &metrics.layer_times,
+            AfdEvalPhase::Decode,
+            1024,
+            128,
+            true,
+        )
+        .expect("eval with fill");
+        let without_fill = evaluate_afd_phase_with_fill(
+            &timing.knobs,
+            &metrics.layer_times,
+            AfdEvalPhase::Decode,
+            1024,
+            128,
+            false,
+        )
+        .expect("eval without fill");
+
+        assert_eq!(first, with_fill.step_latency_ms);
+        assert_eq!(steady, without_fill.step_latency_ms);
+        assert_eq!(steady_again, without_fill.step_latency_ms);
+        assert!(steady < first);
+    }
+
+    /// Instantaneous amortized fill: a pass at the configured pipeline
+    /// depth is steady (cycle only); a shallower pass is a boundary and pays
+    /// the fill in full.
+    #[test]
+    fn amortized_fill_waives_fill_only_at_steady_pipeline_depth() {
+        let timing = provider_with_fill(false, AfdPipelineFillMode::Amortized);
+        let steady = timing
+            .predict_decode_ms(18, 18 * 1100, 1100, 1 << 20)
+            .expect("steady decode");
+        let boundary = timing
+            .predict_decode_ms(12, 12 * 1100, 1100, 1 << 20)
+            .expect("boundary decode");
+        let per_pass = provider(false);
+        let per_pass_steady = per_pass
+            .predict_decode_ms(18, 18 * 1100, 1100, 1 << 20)
+            .expect("per-pass steady");
+        let per_pass_boundary = per_pass
+            .predict_decode_ms(12, 12 * 1100, 1100, 1 << 20)
+            .expect("per-pass boundary");
+
+        assert!(steady < per_pass_steady);
+        assert_eq!(boundary, per_pass_boundary);
     }
 
     /// Continuous-batching clamp: the instantaneous decode step shrinks as

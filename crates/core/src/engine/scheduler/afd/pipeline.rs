@@ -69,13 +69,30 @@ pub enum AfdEvalPhase {
     Decode,
 }
 
-/// Evaluate one AFD phase (serial cadence for one microbatch).
+/// Evaluate one AFD phase (serial cadence for one microbatch). Every pass
+/// pays the pipeline fill.
 pub fn evaluate_afd_phase(
     knobs: &AfdPipelineKnobs,
     times: &AfdLayerTimes,
     phase: AfdEvalPhase,
     input_length: u32,
     output_length: u32,
+) -> Result<AfdPhaseEvaluation, AicError> {
+    evaluate_afd_phase_with_fill(knobs, times, phase, input_length, output_length, true)
+}
+
+/// [`evaluate_afd_phase`] with an explicit fill policy: `charge_fill=false`
+/// prices the steady-state pipeline (cycle terms only — the fill is paid
+/// once at pipeline startup, not per pass). The reported
+/// `pipeline_fill_ms`/`cycle_ms` geometry fields are unaffected; only the
+/// charged `step_latency_ms` drops the fill.
+pub fn evaluate_afd_phase_with_fill(
+    knobs: &AfdPipelineKnobs,
+    times: &AfdLayerTimes,
+    phase: AfdEvalPhase,
+    input_length: u32,
+    output_length: u32,
+    charge_fill: bool,
 ) -> Result<AfdPhaseEvaluation, AicError> {
     if input_length < 1 || output_length < 1 {
         return Err(AicError::InvalidEngineConfig(format!(
@@ -126,7 +143,8 @@ pub fn evaluate_afd_phase(
         };
 
     let fill = t_a + t_f + t_a2f + t_f2a;
-    let step = (fill + cycle * (num_microbatches * times.num_layers).saturating_sub(1) as f64)
+    let step = ((if charge_fill { fill } else { 0.0 })
+        + cycle * (num_microbatches * times.num_layers).saturating_sub(1) as f64)
         * knobs.latency_correction;
     if step <= 0.0 {
         return Err(AicError::InvalidEngineConfig(

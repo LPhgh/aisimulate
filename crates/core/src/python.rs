@@ -960,11 +960,12 @@ fn resolve_role_timing(
         let perf = AfdForwardPassPerfModel::build(perf_config)
             .context("failed to build the aic-afd per-pool perf model")?;
         check_afd_memory_fit_py(&wire, &perf, role.rank.afd.as_ref())?;
-        return Ok(Some(Arc::new(AfdTimingModel::with_decode_identity(
+        return Ok(Some(Arc::new(AfdTimingModel::with_fill_mode(
             perf,
             isl,
             osl,
             wire.frozen_decode_identity,
+            wire.pipeline_fill_mode,
         ))));
     }
     ensure!(

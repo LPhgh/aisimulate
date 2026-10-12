@@ -1,0 +1,34 @@
+# Pure AFD + amortized pipeline fill (non-conservative throughput caliber,
+# non-default knob).
+#
+# pipeline_fill_mode: amortized - steady-state decode passes pay cycle terms
+# only; the pipeline fill is charged on the first decode pass (startup). The
+# default per_pass charges the full fill on every pass (conservative, island
+# parity). Boundary passes clamped below the configured depth (m' < m) still
+# pay the fill in full.
+
+traffic:
+  source: {type: synthetic, input_tokens: 1024, output_tokens: 128}
+  load:   {type: concurrency, concurrency: 8}
+  stop:   {requests: 32}
+
+engine:
+  mode: afd
+  model: Qwen/Qwen3-32B
+  hardware: h200_sxm          # node width 8
+  backend: sglang
+  backend_version: "0.5.14"
+  context_length: max
+  afd:
+    phase: both
+    combined_with_pd: false
+    n_a_nodes: 1
+    n_f_nodes: 1
+    tp_a: 8
+    a_batch_size: 18
+    num_microbatches: 3
+    pipeline_model: full_overlap
+    pipeline_fill_mode: amortized
+
+evaluation:
+  sla: {ttft_ms: 800, itl_ms: 30}

@@ -51,6 +51,7 @@ import afd_parity
 E2E_CASES = (
     "qwen3-32b-h200-sglang-pure-both",
     "qwen3-32b-h200-sglang-pure-both-saturated",
+    "qwen3-32b-h200-sglang-fill-amortized",
 )
 
 

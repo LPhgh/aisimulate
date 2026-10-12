@@ -1607,6 +1607,19 @@ fn default_true() -> bool {
     true
 }
 
+/// Pipeline `fill` charging policy for the AFD timing provider.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AfdPipelineFillMode {
+    /// Pay the pipeline fill on every pass (conservative).
+    #[default]
+    PerPass,
+    /// Charge the fill only where the pipeline cannot be in steady state:
+    /// the first decode pass for the frozen identity, and instantaneous
+    /// passes whose effective microbatch count is below the configured depth.
+    Amortized,
+}
+
 /// Wire configuration of the `"aic-afd"` timing provider: the
 /// JSON payload the compiler emits as `timing_model.config` for AFD roles.
 /// Converts 1:1 into [`AfdForwardPassModelConfig`]; `isl`/`osl` additionally
@@ -1642,6 +1655,13 @@ pub struct AfdTimingConfig {
     /// (trace/agentic) evaluates the pipeline instantaneously per pass.
     #[serde(default = "default_true")]
     pub frozen_decode_identity: bool,
+    /// Pipeline `fill` charging policy: `per_pass` (default) pays the
+    /// fill on every pass (conservative); `amortized` charges
+    /// the fill only where the pipeline cannot be in steady state — the first
+    /// decode pass for the frozen identity, and boundary passes (effective
+    /// microbatch count below the configured depth) on the instantaneous path.
+    #[serde(default)]
+    pub pipeline_fill_mode: AfdPipelineFillMode,
     pub a_pool: AfdAPoolSpec,
     pub f_pool: AfdFPoolSpec,
     pub num_microbatches: u32,

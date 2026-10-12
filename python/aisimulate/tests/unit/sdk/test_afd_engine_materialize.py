@@ -84,6 +84,40 @@ def test_mtp_wires_depth_and_accept_rates_into_the_rank_config():
     assert engine["timing_model"]["config"]["nextn"] == 2
 
 
+def test_pipeline_fill_mode_passes_through_to_the_timing_config():
+    topology = {
+        "phase": "both",
+        "tp_a": 8,
+        "n_a_nodes": 1,
+        "a_batch_size": 18,
+        "f_moe_ep_size": 1,
+        "n_f_nodes": 1,
+        "gpus_per_node": 8,
+        "num_microbatches": 3,
+        "pipeline_fill_mode": "amortized",
+    }
+    deployment = BackendDeploymentSpec(
+        deployment_mode="afd",
+        backend="sglang",
+        backend_version="0.5.14",
+        parallel_config={"afd": topology},
+        performance_model_metadata={"afd": _metadata()},
+    )
+    spec = _spec(deployment)
+    engine = _materialize_afd_engine_role(spec.backend_deployment, spec)["rank"]
+
+    assert engine["timing_model"]["config"]["pipeline_fill_mode"] == "amortized"
+    # The fill policy is a timing knob: it must not leak into the rank's afd
+    # metadata (Rust `AfdEngineConfig` denies unknown fields).
+    assert "pipeline_fill_mode" not in engine["afd"]
+
+
+def test_pipeline_fill_mode_defaults_to_per_pass():
+    spec = _spec(_deployment(_metadata()))
+    engine = _materialize_afd_engine_role(spec.backend_deployment, spec)["rank"]
+    assert engine["timing_model"]["config"]["pipeline_fill_mode"] == "per_pass"
+
+
 def test_non_both_phase_is_rejected_loudly():
     # afd+pd two-pool handoff is retired on the continuous path (future work).
     spec = _spec(_deployment(_metadata(nextn=1, nextn_accepted=0.85), phase="decode"))

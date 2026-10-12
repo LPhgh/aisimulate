@@ -56,6 +56,8 @@ class AFDTopologyPredictionConfig(StrictModel):
     pipeline_model: AFDPipelineModel = "full_overlap"
     comm_overhead_factor: PositiveFloat = 1.0
     boundary_on_attn: bool = Field(default=True, strict=True)
+    # Pipeline fill charging policy for the AFD timing provider.
+    pipeline_fill_mode: Literal["per_pass", "amortized"] = "per_pass"
     # Optional per-pool perf-DB systems for heterogeneous A/F SKU pairs.
     # Omit for homogeneous deployments (both pools inherit the
     # top-level ``hardware``). Both systems must share the same node width.

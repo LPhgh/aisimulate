@@ -475,6 +475,7 @@ def _materialize_afd_engine_role(
         # KV window for the native memory gate (context_length = max reserves
         # the full window per request; absent means isl+osl).
         "max_seq_len": int(context_length or 0) or None,
+        "pipeline_fill_mode": str(topology.get("pipeline_fill_mode") or "per_pass"),
         # Decode identity: the frozen stride average only holds for
         # fixed synthetic workloads (random_range_ratio 1.0); anything with
         # per-request length variation uses the instantaneous per-pass pipeline
