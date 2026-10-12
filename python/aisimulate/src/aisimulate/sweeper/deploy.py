@@ -213,10 +213,24 @@ def build_backend_deployment(
         }
         performance_model_metadata = {
             "afd": {
-                "provider": "unresolved",
-                "measurement_required": True,
+                "provider": "aic-afd",
+                "measurement_required": False,
                 "config": sample["afd"],
                 "provenance": sample["afd_provenance"],
+                # Identity for the native materializer + memory gate (Phase
+                # 4.1/6.1).
+                "model": sample["model_name"],
+                "hardware": sample["hardware_sku"],
+                "context_length": sample.get("context_length"),
+                # Optional provider passthroughs, shaped like the compiler
+                # path's metadata (the runner defaults them when absent):
+                # MTP draft depth and the explicit quant/estimator overrides
+                # the aic-afd provider honors verbatim. nextn_accepted feeds
+                # the rank's burst sampler (benefit side).
+                "nextn": sample.get("nextn", 0),
+                **({"nextn_accepted": sample["nextn_accepted"]} if sample.get("nextn_accepted") is not None else {}),
+                **({"quant": sample["quant"]} if isinstance(sample.get("quant"), dict) else {}),
+                **({"estimator": sample["estimator"]} if isinstance(sample.get("estimator"), dict) else {}),
             }
         }
         afd_common = {

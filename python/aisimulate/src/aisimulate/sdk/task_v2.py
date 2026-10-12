@@ -415,7 +415,7 @@ def _build_afd_parallel_lists(
         tp_a_candidates = sorted({int(tp) for tp in tp_a_candidates if gpus_per_node % int(tp) == 0})
 
     microbatch_candidates = list(search.get("microbatch_list") or [2, 3, 4])
-    pipeline_candidates = list(search.get("pipeline_model_list") or ["optimistic", "conservative"])
+    pipeline_candidates = list(search.get("pipeline_model_list") or ["full_overlap", "partial_overlap"])
     f_moe_ep_size_list = search.get("f_moe_ep_size_list")
     max_af_ratio = float(search.get("max_af_ratio", 4.0))
     max_candidates = int(search.get("max_candidates", 10_000))
@@ -450,14 +450,14 @@ def _build_afd_parallel_lists(
                 for f_moe_ep_size in ep_candidates:
                     for num_microbatches in microbatch_candidates:
                         for pipeline_model in pipeline_candidates:
-                            # Skip optimistic + mb < 3: the K=3 pipeline
+                            # Skip full_overlap + mb < 3: the K=3 pipeline
                             # requires num_microbatches >= 2 + t_c/max(t_a,
                             # t_f), which is >= 3 whenever t_c > 0 (the
-                            # normal case).  mb=2 + optimistic always degrades
-                            # to conservative, producing a duplicate of the
-                            # mb=2 + conservative candidate and a flood of
-                            # per-stride warnings.
-                            if pipeline_model == "optimistic" and num_microbatches < 3:
+                            # normal case).  mb=2 + full_overlap always
+                            # degrades to partial_overlap, producing a
+                            # duplicate of the mb=2 + partial_overlap
+                            # candidate and a flood of per-stride warnings.
+                            if pipeline_model in ("full_overlap", "optimistic") and num_microbatches < 3:
                                 continue
                             candidates.append(
                                 (n_a_nodes, n_f_nodes, tp_a, f_moe_ep_size, num_microbatches, pipeline_model)

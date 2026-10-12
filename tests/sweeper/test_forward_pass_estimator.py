@@ -475,7 +475,7 @@ def test_raw_config_rejects_trailing_json():
         aisimulate_core.RustForwardPassPerfModel.normalize_config(payload)
 
 
-@pytest.mark.parametrize("deployment_mode", ["afd", "afd+pd"])
+@pytest.mark.parametrize("deployment_mode", ["afd"])
 @pytest.mark.parametrize(
     "controls",
     [
@@ -496,12 +496,13 @@ def test_afd_rejects_role_estimator_controls(deployment_mode, controls):
             model_name="m",
             hardware_sku="h200_sxm",
             deployment_mode=[deployment_mode],
+            backend=["sglang"],
             afd_batch_size_candidates=[1],
             role_estimator_controls={"decode": controls},
         )
 
 
-@pytest.mark.parametrize("deployment_mode", ["afd", "afd+pd"])
+@pytest.mark.parametrize("deployment_mode", ["afd"])
 @pytest.mark.parametrize("forward_model", ["op_level", "fpm"])
 def test_afd_saved_search_preserves_legacy_selection(deployment_mode, forward_model):
     from aisimulate.sweeper.config import SearchSpace
@@ -510,6 +511,7 @@ def test_afd_saved_search_preserves_legacy_selection(deployment_mode, forward_mo
         model_name="m",
         hardware_sku="h200_sxm",
         deployment_mode=[deployment_mode],
+        backend=["sglang"],
         afd_batch_size_candidates=[1],
         prefill_forward_model=forward_model,
     )

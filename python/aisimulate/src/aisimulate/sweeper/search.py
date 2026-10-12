@@ -43,7 +43,6 @@ from tqdm import tqdm
 
 from ..power import POWER_FIELDS, normalize_power_summary
 from ..resources import ResourceLimitError
-from .afd_perfmodel import AFDPerformanceModel, AICAFDPerformanceModel, attach_afd_measurements
 from .config import Candidate, OptimizationGoal, OptimizationTarget, SmartSearchConfig
 from .deploy import build_backend_deployment
 from .discovery import resolve_providers
@@ -573,7 +572,6 @@ def _materialize_one(
     providers: Mapping[str, SweepConfigProvider],
     provider_plans: Mapping[str, AdapterSearchPlan],
     runner_factory: RunnerFactory,
-    afd_performance_model: AFDPerformanceModel | None = None,
     prediction_config_factory: Callable[[dict[str, Any], ReplaySpec], dict[str, Any]] | None = None,
     encoder_catalog: Mapping[str, Any] | None = None,
     estimator_resolver: ForwardPassEstimatorResolver | None = None,
@@ -680,13 +678,9 @@ def _materialize_one(
         backend_deployment = build_backend_deployment(
             sample, backend_version=backend_version, encoder=encoder, forward_pass_estimators=forward_pass_estimators
         )
-        if sample["deployment_mode"] in {"afd", "afd+pd"}:
-            backend_deployment = attach_afd_measurements(
-                backend_deployment,
-                sample=sample,
-                workload=workload_payload,
-                performance_model=afd_performance_model or AICAFDPerformanceModel(),
-            )
+        # No compile-time measurement freeze — the native aic-afd
+        # provider measures at replay time (infeasible candidates fail there,
+        # e.g. via the per-pool memory gate).
         adapter_specs: dict[str, AdapterReplaySpec] = {}
         for name, provider in providers.items():
             candidate_context = CandidateContext(
@@ -1085,14 +1079,12 @@ class Sweeper:
         sampler_factory: Callable[..., BranchSampler] = make_branch_sampler,
         show_progress: bool = True,
         prediction_config_factory: Callable[[dict[str, Any], ReplaySpec], dict[str, Any]] | None = None,
-        afd_performance_model: AFDPerformanceModel | None = None,
     ) -> None:
         self._runner_factory = runner_factory
         self._providers = dict(providers or {})
         self._sampler_factory = sampler_factory
         self._show_progress = show_progress
         self._prediction_config_factory = prediction_config_factory
-        self._afd_performance_model = afd_performance_model or AICAFDPerformanceModel()
 
     def run(
         self,
@@ -1123,7 +1115,6 @@ class Sweeper:
         sampler_factory = self._sampler_factory
         show_progress = self._show_progress
         prediction_config_factory = self._prediction_config_factory
-        afd_performance_model = self._afd_performance_model
 
         estimator_resolver = ForwardPassEstimatorResolver(config.search_space)
         goal = config.goal
@@ -1576,7 +1567,6 @@ class Sweeper:
                             providers=resolved_providers,
                             provider_plans=provider_plans,
                             runner_factory=runner_factory,
-                            afd_performance_model=afd_performance_model,
                             prediction_config_factory=prediction_config_factory,
                             encoder_catalog=encoder_catalog,
                         )

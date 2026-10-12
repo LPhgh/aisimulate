@@ -9,7 +9,7 @@ engine:
   mode: afd
   model: tests/e2e/configs/unified_cli/fixtures/tiny-model
   hardware: h200_sxm
-  backend: vllm
+  backend: sglang
   context_length: 2048
   afd:
     phase: both
@@ -19,4 +19,4 @@ engine:
     tp_a: 8
     a_batch_size: 8
     num_microbatches: 3
-    pipeline_model: optimistic
+    pipeline_model: full_overlap

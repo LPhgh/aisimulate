@@ -16,6 +16,7 @@ from typing import Any, Protocol, runtime_checkable
 from pydantic import BaseModel
 
 from ..config.common import ENGINE_MODEL_CONTROL_FIELDS, is_active_engine_model_control
+from ..config.common import require_native_afd as _require_native_afd
 from ..power import POWER_FIELDS, normalize_power_summary
 from .provider import AdapterReplaySpec, JSONValue, RuntimeHookSpec
 
@@ -311,11 +312,12 @@ class RunnerCapabilities:
             raise ValueError(f"runner does not support execution mode {spec.execution_mode!r}")
         deployment = spec.backend_deployment
         is_afd = deployment.deployment_mode in {"afd", "afd+pd"}
-        if spec.workload.get("cached_prefix_tokens"):
-            if is_afd:
-                raise ValueError("cached_prefix_tokens is unsupported for AFD")
-            if not self.supports_cached_prefix_tokens:
-                raise ValueError("runner does not support cached_prefix_tokens; use --stack engine")
+        if is_afd:
+            # Loud rejection of retired AISIMULATE_AFD_NATIVE values
+            # ("0" / "shadow").
+            _require_native_afd()
+        if spec.workload.get("cached_prefix_tokens") and not self.supports_cached_prefix_tokens:
+            raise ValueError("runner does not support cached_prefix_tokens; use --stack engine")
         for args in (deployment.agg_engine_args, deployment.prefill_engine_args, deployment.decode_engine_args):
             if not isinstance(args, Mapping):
                 continue
@@ -344,11 +346,10 @@ class RunnerCapabilities:
                 raise ValueError(
                     f"runner does not support engine model controls {unsupported_controls}; use --stack engine"
                 )
-            if any(rank.get(name) is not None for name in ("aic_nextn_accepted", "nextn_accepted")):
-                if is_afd:
-                    raise ValueError("explicit MTP expected acceptance is unsupported for AFD")
-                if not self.supports_mtp_expected_acceptance:
-                    raise ValueError("runner does not support explicit MTP expected acceptance; use --stack engine")
+            if any(rank.get(name) is not None for name in ("aic_nextn_accepted", "nextn_accepted")) and (
+                not self.supports_mtp_expected_acceptance
+            ):
+                raise ValueError("runner does not support explicit MTP expected acceptance; use --stack engine")
             if is_afd and rank.get("enable_chunked_prefill") is not None:
                 raise ValueError("enable_chunked_prefill is unsupported for AFD")
         if not self.supports_state_cache:

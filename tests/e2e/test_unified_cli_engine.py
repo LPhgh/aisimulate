@@ -52,7 +52,6 @@ _EXPECTED_RECOMMEND_CASES = (
     "04-mixed-disagg-pareto.yaml",
     "05-kv-fraction-goodput.yaml",
     "06-override-parallel-mappings-agg-disagg.yaml",
-    "07-afd-plus-pd.yaml",
     "08-heterogeneous-pd.yaml",
 )
 _PREDICT_CASES = tuple(sorted((_REPO_ROOT / _CONFIG_ROOT / "predict/engine").glob("*.yaml")))
@@ -382,14 +381,6 @@ def test_engine_recommend_cli_cases_round_trip(config_path: Path, tmp_path: Path
             assert metrics["completed_requests"] == 6
             for key in ("mean_ttft_ms", "mean_tpot_ms", "output_throughput_tok_s"):
                 assert metrics[key] == pytest.approx(candidate.metrics[key])
-        if config_path.name == "07-afd-plus-pd.yaml":
-            qualification = json.loads((prediction_output / "afd-qualification.json").read_text(encoding="utf-8"))
-            assert qualification["identity"]["deployment_mode"] == "afd+pd"
-            assert qualification["deployment_plan"]["pools"]["companion"]["role"] in {
-                "prefill",
-                "decode",
-            }
-            assert qualification["deployment_plan"]["launch"]["supported"] is False
 
     if config_path.name == "06-override-parallel-mappings-agg-disagg.yaml":
         assert generated_modes == {"aggregated", "disaggregated"}

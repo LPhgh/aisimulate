@@ -731,13 +731,11 @@ def build_database_probe_spec_json(
 # --------------------------------------------------------------------------- #
 # Model-less probe plumbing.
 #
-# A small LRU of probe engines keyed by database identity, serving the two
-# PERMANENT consumers that need engine values without a compiled model: the
-# table-view bindings (``engine_table_view.fetch_table_view``) and the
-# single-op evaluation helper behind the Python-side orchestration surfaces
-# (the AFD comm ops, the ``_sum_latency`` fallback loop). It is NOT a public
-# per-op query surface — the deprecated ``query_*``/``Operation.query`` shims
-# that once rode this plumbing were removed after their one-release window;
+# A small LRU of probe engines keyed by database identity, serving the
+# consumers that need engine values without a compiled model: the table-view
+# bindings (``engine_table_view.fetch_table_view``) and the single-op
+# evaluation helper behind ``Operation._engine_query`` (pinned by the
+# single-oracle contract tests). It is NOT a public per-op query surface —
 # long-term callers use ``EngineHandle.evaluate_ops_json`` /
 # ``evaluate_ops_sol_json`` (op-list FFI) or the phase/run entry points.
 # --------------------------------------------------------------------------- #
@@ -830,12 +828,8 @@ def _evaluate_single_op(
     """Evaluate ONE Python ``Operation`` through the compiled engine, under
     the database's live mode.
 
-    The permanent single-op plumbing behind the Python-side ORCHESTRATION
-    surfaces (the AFD comm ops' twin evaluation, the ``_sum_latency``
-    fallback loop). The retired per-call query shims used to ride this too,
-    with a per-call ``database_mode`` re-moding dimension (including the
-    ``SOL_FULL`` decomposition triple) — that dimension left with the shims;
-    per-call SOL decomposition is served by
+    The single-op plumbing behind ``Operation._engine_query``, pinned by the
+    single-oracle contract tests. Per-call SOL decomposition is served by
     ``EngineHandle.evaluate_ops_sol_json`` directly."""
     from aisimulate_core.sdk.operations.attention import ContextAttention, GenerationAttention
     from aisimulate_core.sdk.performance_result import PerformanceResult

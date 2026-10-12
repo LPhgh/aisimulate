@@ -659,7 +659,7 @@ def test_native_epd_search_smoke(mode, total_gpus):
     assert candidate.config["encoder"]["image_count"] == 1
 
 
-@pytest.mark.parametrize("mode", ["afd", "afd+pd"])
+@pytest.mark.parametrize("mode", ["afd"])
 def test_epd_rejects_afd_search_before_materialization(mode):
     payload = _config().model_dump(mode="json")
     payload["search_space"].update(

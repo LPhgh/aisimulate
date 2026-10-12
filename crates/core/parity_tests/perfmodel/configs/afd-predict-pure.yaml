@@ -1,0 +1,46 @@
+# Pure-AFD single-point prediction (phase=both, no P/D companion).
+#
+# Maps to the runner's internal deployment_mode="afd": the AFD pool runs on the
+# SGLang continuous-batching scheduler core (mid-flight admission + retract
+# preemption, the whole pool bounded by max_num_seqs = n_a_workers *
+# a_batch_size) with the `"aic-afd"` timing provider injected (measured at
+# replay time, no compile-time frozen measurement). Scheduling and perf data
+# are anchored to the sglang family together.
+#
+# Conventions:
+#   - a pure-AFD phase must be both (combined_with_pd: false)
+#   - the native path also accepts trace / variable-length synthetic traffic
+#     (this golden case uses a fixed-length synthetic source)
+#   - a_batch_size must be a concrete memory-qualified value (no implicit default)
+#   - backend_version is pinned explicitly so the golden never drifts with DB updates
+#   - gpus_per_node / is_moe / num_experts are not written in the YAML; they are
+#     derived by resolve_model_hardware(model, hardware) and merged into engine.afd
+
+traffic:
+  source: {type: synthetic, input_tokens: 1024, output_tokens: 128}
+  load:   {type: concurrency, concurrency: 8}
+  stop:   {requests: 32}
+
+engine:
+  mode: afd
+  model: Qwen/Qwen3-32B
+  hardware: h200_sxm          # node width 8
+  backend: sglang
+  backend_version: "0.5.14"
+  context_length: max
+  afd:
+    phase: both               # pure AFD must be both
+    combined_with_pd: false   # no companion
+    n_a_nodes: 1              # A pool (attention) node count
+    n_f_nodes: 1              # F pool (FFN/MoE) node count
+    tp_a: 8                   # TP of the A worker; must divide gpus_per_node
+    a_batch_size: 18         # per-A-worker batch
+    num_microbatches: 3
+    pipeline_model: full_overlap
+    # Optional defaults:
+    # f_moe_ep_size: 1        # forced to 1 for dense models; MoE may use the n_f_nodes / ffn_tp symbol
+    # comm_overhead_factor: 1.0
+    # boundary_on_attn: true
+
+evaluation:
+  sla: {ttft_ms: 800, itl_ms: 30}

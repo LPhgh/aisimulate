@@ -947,7 +947,7 @@ def evaluate_generation_ops_with_rust(
     """Evaluate an index-addressed sublist of the compiled generation op list
     at the decode-step shape (see ``evaluate_context_ops_with_rust``). The
     base decode walk carries no prefix; ``prefix`` exists for orchestrations
-    that thread it (AFD's ``_sum_latency``)."""
+    that thread it."""
     handle = _cached_engine_handle(model, database)
     result = handle.evaluate_generation_ops(
         list(indices),

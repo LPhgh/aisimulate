@@ -553,15 +553,20 @@ class SearchSpace(BaseModel):
     encoder: EncoderSearch | None = None
 
     # Attention--FFN disaggregation. The A/F topology is a finite, complete
-    # domain; ``afd+pd`` pairs each topology with one opposite-phase companion.
+    # domain. ``afd+pd`` (pairing each topology with one opposite-phase
+    # companion) is rejected by ``_validate_afd_contract`` until the two-pool
+    # handoff lands on the continuous SGLang core, so
+    # ``afd_companion_parallel_configs`` is inert for now: it is kept because
+    # any non-empty value must fail loudly rather than be ignored, and because
+    # the companion product returns with that handoff.
     afd_pinned_topologies: list[dict[str, Any]] = Field(default_factory=list)
     afd_companion_parallel_configs: list[dict[str, Any]] = Field(default_factory=list)
     afd_tp_a_candidates: list[int] | None = None
     afd_batch_size_candidates: list[int] | None = None
     afd_f_moe_ep_size_candidates: list[int | str] | None = None
     afd_microbatch_candidates: list[int] = Field(default_factory=lambda: [2, 3, 4])
-    afd_pipeline_model_candidates: list[str] = Field(default_factory=lambda: ["optimistic", "conservative"])
-    afd_phase: str = "decode"
+    afd_pipeline_model_candidates: list[str] = Field(default_factory=lambda: ["full_overlap", "partial_overlap"])
+    afd_phase: str = "both"
     afd_comm_overhead_factor: float = Field(default=1.0, gt=0)
     afd_boundary_on_attn: bool = True
     afd_max_af_ratio: float = Field(default=4.0, gt=0)
@@ -786,14 +791,39 @@ class SearchSpace(BaseModel):
     @model_validator(mode="after")
     def _validate_afd_contract(self) -> SearchSpace:
         afd_modes = [mode for mode in dict.fromkeys(self.deployment_mode) if mode in {"afd", "afd+pd"}]
+        if "afd+pd" in afd_modes:
+            raise ValueError(
+                "deployment_mode='afd+pd' (two-pool prefill/decode handoff) is not supported by "
+                "the continuous SglangCore AFD path yet; use deployment_mode='afd' (phase='both')"
+            )
+        if afd_modes and self.backend != ["sglang"]:
+            raise ValueError(
+                "AFD runs on the continuous SGLang scheduling core and anchors sglang perf data; "
+                f"set backend=['sglang'] (got {self.backend!r})"
+            )
         if self.afd_phase not in {"prefill", "decode", "both"}:
             raise ValueError("afd_phase must be 'prefill', 'decode', or 'both'")
-        if any(value not in {"optimistic", "conservative", "serial"} for value in self.afd_pipeline_model_candidates):
-            raise ValueError("afd_pipeline_model_candidates accepts optimistic, conservative, or serial")
+        if afd_modes and self.afd_phase != "both":
+            raise ValueError("pure AFD search requires afd_phase='both'")
+        if any(
+            value
+            not in {
+                "no_overlap",
+                "partial_overlap",
+                "full_overlap",
+                # Legacy aliases still accepted for backward compatibility.
+                "optimistic",
+                "conservative",
+                "serial",
+            }
+            for value in self.afd_pipeline_model_candidates
+        ):
+            raise ValueError(
+                "afd_pipeline_model_candidates accepts no_overlap, partial_overlap, or full_overlap "
+                "(legacy: serial, conservative, optimistic)"
+            )
         if len(set(self.afd_pipeline_model_candidates)) != len(self.afd_pipeline_model_candidates):
             raise ValueError("afd_pipeline_model_candidates must not contain duplicates")
-        if "afd+pd" in afd_modes and self.afd_phase == "both":
-            raise ValueError("deployment_mode='afd+pd' requires afd_phase prefill or decode")
         if afd_modes and not self.afd_pinned_topologies and self.afd_batch_size_candidates is None:
             raise ValueError(
                 "searched AFD requires explicit, memory-qualified afd_batch_size_candidates; "
@@ -1191,8 +1221,6 @@ class SmartSearchConfig(BaseModel):
     @model_validator(mode="after")
     def _validate_epd(self) -> SmartSearchConfig:
         encoder, workload = self.search_space.encoder, self.workload
-        if workload.cached_prefix_tokens and set(self.search_space.deployment_mode) & {"afd", "afd+pd"}:
-            raise ValueError("cached_prefix_tokens is unsupported for AFD")
         if (encoder is None) != (workload.images is None):
             raise ValueError("EPD requires both search_space.encoder and workload.images")
         if encoder is None:

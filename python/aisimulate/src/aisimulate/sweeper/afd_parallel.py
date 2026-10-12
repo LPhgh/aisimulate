@@ -34,11 +34,28 @@ class AFDPhase(str, Enum):
 
 
 class AFDPipelineModel(str, Enum):
-    """How A/F compute and activation transfers overlap."""
+    """How A/F compute and activation transfers overlap.
 
-    OPTIMISTIC = "optimistic"
-    CONSERVATIVE = "conservative"
-    SERIAL = "serial"
+    Named for the degree of communication/compute overlap. The legacy
+    ``serial`` / ``conservative`` / ``optimistic`` strings stay accepted (see
+    ``_missing_``) so frozen goldens and existing configs keep parsing.
+    """
+
+    NO_OVERLAP = "no_overlap"
+    PARTIAL_OVERLAP = "partial_overlap"
+    FULL_OVERLAP = "full_overlap"
+
+    @classmethod
+    def _missing_(cls, value):
+        # Legacy aliases for the pre-rename regime names.
+        legacy = {
+            "serial": cls.NO_OVERLAP,
+            "conservative": cls.PARTIAL_OVERLAP,
+            "optimistic": cls.FULL_OVERLAP,
+        }
+        if isinstance(value, str):
+            return legacy.get(value.lower())
+        return None
 
 
 class AFDReasonCategory(str, Enum):
@@ -115,7 +132,7 @@ def _enum_value(enum_type, value, name: str):
 class AFDTopology:
     """One concrete A/F topology.
 
-    Phase-1 legacy semantics are retained: one F replica spans every F GPU, so
+    Legacy F-side semantics are retained: one F replica spans every F GPU, so
     ``ffn_tp == ffn_workers == n_f_nodes * gpus_per_node``.  A workers use TP
     ``tp_a`` and data-parallel replicas across the A pool.
     """
@@ -127,13 +144,19 @@ class AFDTopology:
     a_batch_size: int
     f_moe_ep_size: int = 1
     num_microbatches: int = 3
-    pipeline_model: AFDPipelineModel | str = AFDPipelineModel.OPTIMISTIC
-    phase: AFDPhase | str = AFDPhase.DECODE
-    combined_with_pd: bool = True
+    pipeline_model: AFDPipelineModel | str = AFDPipelineModel.FULL_OVERLAP
+    phase: AFDPhase | str = AFDPhase.BOTH
+    combined_with_pd: bool = False
     comm_overhead_factor: float = 1.0
     boundary_on_attn: bool = True
     is_moe: bool = False
     num_experts: int = 0
+    # Per-pool perf-DB systems (hetero support). ``None`` inherits
+    # the deployment's top-level hardware (homogeneous); both systems must
+    # share the same node width (the single ``gpus_per_node``), which the
+    # aic-afd timing provider validates against each pool's perf DB.
+    a_system: str | None = None
+    f_system: str | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -274,6 +297,8 @@ class AFDTopology:
                 "boundary_on_attn": self.boundary_on_attn,
                 "is_moe": self.is_moe,
                 "num_experts": self.num_experts,
+                "a_system": self.a_system,
+                "f_system": self.f_system,
             },
             "gpu_accounting": {
                 "attention_gpus": self.attention_gpus,
@@ -347,11 +372,11 @@ class AFDSearchConfig:
     f_moe_ep_size_candidates: tuple[int | str, ...] = ()
     microbatch_candidates: tuple[int, ...] = (2, 3, 4)
     pipeline_model_candidates: tuple[AFDPipelineModel | str, ...] = (
-        AFDPipelineModel.OPTIMISTIC,
-        AFDPipelineModel.CONSERVATIVE,
+        AFDPipelineModel.FULL_OVERLAP,
+        AFDPipelineModel.PARTIAL_OVERLAP,
     )
-    phase: AFDPhase | str = AFDPhase.DECODE
-    combined_with_pd: bool = True
+    phase: AFDPhase | str = AFDPhase.BOTH
+    combined_with_pd: bool = False
     comm_overhead_factor: float = 1.0
     boundary_on_attn: bool = True
     min_gpu_budget: int | None = None
@@ -648,7 +673,7 @@ def enumerate_afd_topologies(config: AFDSearchConfig) -> AFDEnumeration:
                     for ep in ep_candidates:
                         for num_microbatches in config.microbatch_candidates:
                             for pipeline in config.pipeline_model_candidates:
-                                if pipeline is AFDPipelineModel.OPTIMISTIC and num_microbatches < 3:
+                                if pipeline is AFDPipelineModel.FULL_OVERLAP and num_microbatches < 3:
                                     rejections["duplicate_pipeline_regime"] += 1
                                     continue
                                 candidates.append(

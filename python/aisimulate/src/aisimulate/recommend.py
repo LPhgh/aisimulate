@@ -21,7 +21,6 @@ from .config_adapter import (
     SimulationConfigAdapter,
 )
 from .resources import GuardedRunnerFactory, discover_host, resolve_budget
-from .sweeper.afd_perfmodel import AFDPerformanceModel
 from .sweeper.config import SmartSearchConfig
 from .sweeper.provider import InfeasibleCandidate, SweepContext
 from .sweeper.replay import ReplaySpec, RunnerFactory
@@ -35,7 +34,6 @@ def run_recommendation(
     stack: str,
     runner_factory: RunnerFactory,
     providers: Mapping[str, SimulationConfigAdapter] | None = None,
-    afd_performance_model: AFDPerformanceModel | None = None,
     show_progress: bool = True,
 ) -> SweepResult:
     """Run a public recommendation through the existing Sweeper core."""
@@ -47,7 +45,6 @@ def run_recommendation(
         stack=stack,
         runner_factory=runner_factory,
         providers=providers,
-        afd_performance_model=afd_performance_model,
         show_progress=show_progress,
     )
     if not in_supervised_process():
@@ -62,7 +59,6 @@ def _run_recommendation(
     stack: str,
     runner_factory: RunnerFactory,
     providers: Mapping[str, SimulationConfigAdapter] | None = None,
-    afd_performance_model: AFDPerformanceModel | None = None,
     show_progress: bool = True,
 ) -> SweepResult:
     from .supervision import checkpoint
@@ -107,7 +103,6 @@ def _run_recommendation(
         prediction_config_factory=lambda sample, spec: _candidate_prediction(
             config, sample, spec, adapter_sections=adapter_sections
         ),
-        afd_performance_model=afd_performance_model,
     )
     return sweeper.run(smart, top_n=None)
 
@@ -123,10 +118,8 @@ def recommendation_to_sweeper(
     mode_values = _choices(engine.get("mode"), default=["aggregated", "disaggregated"])
     modes = [_legacy_mode(str(value)) for value in mode_values]
     afd = engine.get("afd")
-    if modes == ["afd"]:
-        if not isinstance(afd, dict):
-            raise ValueError("engine.mode='afd' requires engine.afd")
-        modes = ["afd+pd" if afd["combined_with_pd"] else "afd"]
+    if modes == ["afd"] and not isinstance(afd, dict):
+        raise ValueError("engine.mode='afd' requires engine.afd")
     backend_values = _choices(engine.get("backend"), default=["vllm", "sglang"])
     model = engine.get("model")
     if not isinstance(model, str) or not model:
@@ -186,9 +179,7 @@ def recommendation_to_sweeper(
             if name in raw.get("timing", {})
         }
         for role, raw in workers.items()
-        if role in {"aggregated", "prefill", "decode"}
-        and not set(modes) & {"afd", "afd+pd"}
-        and workers.get("encoder") is None
+        if role in {"aggregated", "prefill", "decode"} and "afd" not in modes and workers.get("encoder") is None
     }
     if engine.get("speculation") is not None:
         search_space["speculation"] = deepcopy(engine["speculation"])
@@ -197,24 +188,7 @@ def recommendation_to_sweeper(
             search_space[f"{role}_hardware_sku"] = workers[role]["hardware"]
     if isinstance(afd, dict):
         search_space.update(_afd_search_space(afd))
-        if modes == ["afd+pd"]:
-            companion_role = "decode" if afd["phase"] == "prefill" else "prefill"
-            workers.setdefault(companion_role, {})
-            kind, value = _parallel_entries(companion_role, workers[companion_role])
-            if kind == "flat":
-                search_space["afd_companion_parallel_configs"] = [_legacy_parallel(entry) for entry in value]
-            elif kind == "independent":
-                raise ValueError(
-                    f"engine.workers.{companion_role}.parallelism supports preset=default or a concrete "
-                    "preset list for AFD recommendations"
-                )
-    search_space.update(
-        _role_search_space(
-            workers,
-            modes,
-            afd_phase=afd.get("phase") if isinstance(afd, dict) else None,
-        )
-    )
+    search_space.update(_role_search_space(workers, modes))
     if engine.get("workers", {}).get("encoder") is not None:
         encoder = workers["encoder"]
         search_space["encoder"] = {
@@ -331,7 +305,7 @@ def _afd_search_space(afd: dict[str, Any]) -> dict[str, Any]:
             str(value)
             for value in _choices(
                 afd.get("pipeline_model"),
-                default=["optimistic", "conservative"],
+                default=["full_overlap", "partial_overlap"],
             )
         ],
         "afd_comm_overhead_factor": afd.get("comm_overhead_factor", 1.0),
@@ -349,8 +323,6 @@ def _afd_search_space(afd: dict[str, Any]) -> dict[str, Any]:
 def _role_search_space(
     workers: dict[str, Any],
     modes: list[str],
-    *,
-    afd_phase: str | None = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "engine_float_ranges": {},
@@ -360,16 +332,8 @@ def _role_search_space(
     }
     specifications = (
         ("aggregated", "agg", "agg" in modes),
-        (
-            "prefill",
-            "prefill",
-            "disagg" in modes or ("afd+pd" in modes and afd_phase == "decode"),
-        ),
-        (
-            "decode",
-            "decode",
-            "disagg" in modes or ("afd+pd" in modes and afd_phase == "prefill"),
-        ),
+        ("prefill", "prefill", "disagg" in modes),
+        ("decode", "decode", "disagg" in modes),
     )
     for public_role, legacy_role, required in specifications:
         raw = workers.get(public_role)

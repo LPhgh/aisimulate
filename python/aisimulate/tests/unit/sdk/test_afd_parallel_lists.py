@@ -19,7 +19,7 @@ def test_dense_candidates_respect_budget_and_divisibility():
         assert 8 % tp_a == 0
         assert f_ep == 1  # dense models never shard experts
         assert mb in (2, 3, 4)
-        assert pipe in ("optimistic", "conservative")
+        assert pipe in ("full_overlap", "partial_overlap")
 
 
 def test_moe_expert_divisibility():
@@ -52,7 +52,7 @@ def test_search_config_controls_candidate_axes():
         search_config={
             "tp_a_list": [4],
             "microbatch_list": [3],
-            "pipeline_model_list": ["optimistic"],
+            "pipeline_model_list": ["full_overlap"],
             "f_moe_ep_size_list": [1, "n_f_nodes"],
             "max_af_ratio": 3,
         },
@@ -64,7 +64,7 @@ def test_search_config_controls_candidate_axes():
         assert tp_a == 4
         assert f_ep in {1, n_f}
         assert mb == 3
-        assert pipe == "optimistic"
+        assert pipe == "full_overlap"
 
 
 def test_search_config_errors_when_candidate_count_exceeds_limit():

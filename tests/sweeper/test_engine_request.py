@@ -359,37 +359,90 @@ def test_optional_runner_must_advertise_new_request_capabilities():
     EngineReplayRunnerFactory().capabilities().require_compatible(spec)
 
 
+def test_cached_prefix_tokens_are_accepted_for_afd():
+    # The native aic-afd provider prices prefill at the actual mean prefix, so
+    # both entry points agree: the search config accepts it and the runner
+    # advertises support.
+    from aisimulate.runner import EngineReplayRunnerFactory
+    from aisimulate.sweeper.config import SmartSearchConfig
+    from aisimulate.sweeper.replay import BackendDeploymentSpec
+
+    config = SmartSearchConfig(
+        search_space={
+            "model_name": "example/model",
+            "hardware_sku": "example_sku",
+            "deployment_mode": ["afd"],
+            "backend": ["sglang"],
+            "gpu_budget": 16,
+            "afd_pinned_topologies": [
+                {
+                    "n_a_nodes": 1,
+                    "n_f_nodes": 1,
+                    "tp_a": 2,
+                    "a_batch_size": 16,
+                    "num_microbatches": 3,
+                    "pipeline_model": "full_overlap",
+                }
+            ],
+        },
+        workload={"isl": 128, "osl": 32, "concurrency": 8, "num_request_ratio": 2, "cached_prefix_tokens": 4},
+    )
+    assert config.workload.cached_prefix_tokens == 4
+
+    spec = ReplaySpec(
+        backend_deployment=BackendDeploymentSpec(deployment_mode="afd", backend="sglang", backend_version="0.5.14"),
+        workload={"cached_prefix_tokens": 4},
+        goal={},
+    )
+    EngineReplayRunnerFactory().capabilities().require_compatible(spec)
+
+
+def test_runner_advertises_only_the_continuous_sglang_afd_path():
+    # The capability table drives both sweeper enumeration pruning and
+    # require_compatible, so it must not advertise AFD shapes the runner
+    # rejects later (non-sglang backends, the retired two-pool afd+pd).
+    from aisimulate.runner import EngineReplayRunnerFactory
+
+    capabilities = EngineReplayRunnerFactory().capabilities()
+
+    assert capabilities.supports_backend_topology("sglang", "afd")
+    assert not capabilities.supports_backend_topology("vllm", "afd")
+    assert not capabilities.supports_backend_topology("trtllm", "afd")
+    assert not capabilities.supports_backend_topology("sglang", "afd+pd")
+
+
+@pytest.mark.parametrize(
+    ("value", "error"),
+    [
+        ("0", "Python AFD island"),
+        ("shadow", "not a recognized value"),
+        ("banana", "not a recognized value"),
+    ],
+)
+def test_retired_afd_native_switch_values_fail_loudly(monkeypatch, value, error):
+    from aisimulate.config.common import require_native_afd
+
+    monkeypatch.setenv("AISIMULATE_AFD_NATIVE", value)
+    with pytest.raises(RuntimeError, match=error):
+        require_native_afd()
+
+
+@pytest.mark.parametrize("value", ["1", "", "  1  ", None])
+def test_native_afd_switch_accepts_the_default_path(monkeypatch, value):
+    from aisimulate.config.common import require_native_afd
+
+    if value is None:
+        monkeypatch.delenv("AISIMULATE_AFD_NATIVE", raising=False)
+    else:
+        monkeypatch.setenv("AISIMULATE_AFD_NATIVE", value)
+    require_native_afd()
+
+
 def test_recommendation_rejects_unconfigured_backend_version():
     raw = {**_config(), "optimization": {}}
     raw["engine"]["backend_version"] = {"vllm": "0.24.0"}
     with pytest.raises(ValidationError, match="unconfigured backend"):
         CoreRecommendationConfig.model_validate(raw)
-
-
-@pytest.mark.parametrize("mode", ["afd", "afd+pd"])
-def test_cached_prefix_rejected_by_direct_sweeper_and_replay(mode):
-    from aisimulate.runner import EngineReplayRunnerFactory
-    from aisimulate.sweeper.config import SmartSearchConfig
-    from aisimulate.sweeper.replay import BackendDeploymentSpec
-
-    with pytest.raises(ValueError, match="cached_prefix_tokens is unsupported for AFD"):
-        SmartSearchConfig(
-            search_space={
-                "model_name": "model",
-                "hardware_sku": "h200_sxm",
-                "deployment_mode": [mode],
-                "afd_phase": "decode",
-                "afd_batch_size_candidates": [8],
-            },
-            workload={"isl": 8, "osl": 2, "request_count": 2, "concurrency": 1, "cached_prefix_tokens": 4},
-        )
-    spec = ReplaySpec(
-        backend_deployment=BackendDeploymentSpec(deployment_mode=mode, backend="vllm", backend_version="v"),
-        workload={"cached_prefix_tokens": 4},
-        goal={},
-    )
-    with pytest.raises(ValueError, match="cached_prefix_tokens is unsupported for AFD"):
-        EngineReplayRunnerFactory().create(0).run(spec)
 
 
 @pytest.mark.parametrize("moe_backend", [None, "default"])

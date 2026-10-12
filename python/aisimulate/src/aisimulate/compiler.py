@@ -18,11 +18,6 @@ from .config.common import ENGINE_MODEL_CONTROL_FIELDS, omit_inactive_moe_contro
 from .config.engine import EnginePredictionConfig, WorkerPredictionConfig
 from .config.traffic import SyntheticSessionSource, SyntheticSource, TraceSource
 from .sweeper.afd_parallel import AFDParallelConfig, AFDTopology
-from .sweeper.afd_perfmodel import (
-    AFDPerformanceModel,
-    AICAFDPerformanceModel,
-    attach_afd_measurements,
-)
 from .sweeper.kv_estimate import resolve_backend_version
 from .sweeper.model_hw import resolve_model_hardware
 from .sweeper.parallel_enum import ParallelShape, ReplicaParallelConfig
@@ -34,7 +29,6 @@ def prediction_to_replay_spec(
     config: CorePredictionConfig,
     *,
     adapter_specs: dict[str, AdapterReplaySpec] | None = None,
-    afd_performance_model: AFDPerformanceModel | None = None,
     execution_mode: str = "offline",
 ) -> ReplaySpec:
     """Compile one concrete public prediction config."""
@@ -42,11 +36,7 @@ def prediction_to_replay_spec(
     if config.engine.speculation is not None and (adapter_specs or execution_mode != "offline"):
         raise ValueError("ngram speculation requires the offline engine stack without adapters")
     workload, concurrency = _traffic(config)
-    deployment = _deployment(
-        config.engine,
-        workload=workload,
-        afd_performance_model=afd_performance_model,
-    )
+    deployment = _deployment(config.engine, workload=workload)
     deployment = _pin_estimator_version_aliases(deployment)
     if config.engine.mode == "disaggregated":
         assert config.engine.workers.prefill is not None
@@ -156,14 +146,9 @@ def _deployment(
     engine: EnginePredictionConfig,
     *,
     workload: dict[str, JSONValue],
-    afd_performance_model: AFDPerformanceModel | None,
 ) -> BackendDeploymentSpec:
     if engine.mode == "afd":
-        return _afd_deployment(
-            engine,
-            workload=workload,
-            performance_model=afd_performance_model or AICAFDPerformanceModel(),
-        )
+        return _afd_deployment(engine)
     mode = "agg" if engine.mode == "aggregated" else "disagg"
     if mode == "disagg":
         from aisimulate_core.sdk.perf_database import load_system_spec
@@ -247,20 +232,39 @@ def _deployment(
     )
 
 
-def _afd_deployment(
-    engine: EnginePredictionConfig,
-    *,
-    workload: dict[str, JSONValue],
-    performance_model: AFDPerformanceModel,
-) -> BackendDeploymentSpec:
+def _afd_deployment(engine: EnginePredictionConfig) -> BackendDeploymentSpec:
     afd = engine.afd
     assert afd is not None
     facts = resolve_model_hardware(engine.model, engine.hardware, backend=engine.backend)
+    a_system = afd.a_system or engine.hardware
+    f_system = afd.f_system or engine.hardware
+    # Resolve hardware facts per pool system (heterogeneous
+    # A/F pairs keep one node width; the aic-afd provider validates that
+    # against each pool's perf DB at build time).
+    a_facts = facts
+    if a_system != engine.hardware:
+        a_facts = resolve_model_hardware(engine.model, a_system, backend=engine.backend)
+    f_facts = facts
+    if f_system != engine.hardware:
+        f_facts = resolve_model_hardware(engine.model, f_system, backend=engine.backend)
+    # The topology stamps one node width for both pools, so all three
+    # resolutions must agree — a 4-GPU/node pool (gb200/gb300) paired with an
+    # 8-GPU/node top-level hardware would otherwise be mispriced until the
+    # provider rejects it at build time.
+    if len({facts.gpus_per_node, a_facts.gpus_per_node, f_facts.gpus_per_node}) != 1:
+        raise ValueError(
+            "AFD pools must share one node width: "
+            f"hardware={engine.hardware!r} ({facts.gpus_per_node}), "
+            f"a_system={a_system!r} ({a_facts.gpus_per_node}), "
+            f"f_system={f_system!r} ({f_facts.gpus_per_node})"
+        )
     topology = AFDTopology(
-        **afd.model_dump(mode="python"),
+        **afd.model_dump(mode="python", exclude={"a_system", "f_system"}),
         gpus_per_node=facts.gpus_per_node,
         is_moe=facts.is_moe,
         num_experts=facts.num_experts,
+        a_system=a_system,
+        f_system=f_system,
     )
     backend_version = engine.backend_version or resolve_backend_version(engine.hardware, engine.backend)
     resolved_engine = engine.model_copy(update={"backend_version": backend_version})
@@ -286,10 +290,54 @@ def _afd_deployment(
     }
     performance_metadata: dict[str, dict[str, JSONValue]] = {
         "afd": {
-            "provider": "unresolved",
-            "measurement_required": True,
+            "provider": "aic-afd",
+            "measurement_required": False,
             "config": topology.provenance()["topology"],
             "provenance": afd_parallel.provenance(),
+            # Identity for the native materializer: the runner does not read
+            # the frozen measurement provenance.
+            "model": engine.model,
+            "hardware": engine.hardware,
+            # KV window for the native memory gate: the qualification reserves
+            # KV for the full context window per request — "max" resolves to
+            # the model's max context length.
+            "context_length": (
+                engine.context_length
+                if isinstance(engine.context_length, int)
+                else resolve_model_context_length(engine.model)
+            ),
+            # Estimator policy passthrough for the aic-afd provider: the
+            # native path honors these verbatim.
+            "estimator": {
+                key: value
+                for key, value in {
+                    "database_mode": engine.database_mode,
+                    "transfer_policy": engine.transfer_policy,
+                    "systems_paths": engine.systems_paths,
+                    "estimation_mode": engine.estimation_mode,
+                    "fallback_policy": engine.fallback_policy,
+                    "estimator_config": engine.estimator_config,
+                }.items()
+                if value not in (None, "SILICON", "auto", "deny", {})
+            },
+            "quant": {
+                key: value
+                for key, value in {
+                    "gemm_quant_mode": engine.gemm_quant_mode,
+                    "moe_quant_mode": engine.moe_quant_mode,
+                    "fmha_quant_mode": engine.fmha_quant_mode,
+                    "kvcache_quant_mode": engine.kvcache_quant_mode,
+                    "comm_quant_mode": engine.comm_quant_mode,
+                }.items()
+                if value is not None
+            },
+            # MTP draft depth for the native verify-width cost + sampler
+            # acceptance; 0 when MTP is off. nextn_accepted feeds
+            # the rank's burst sampler (the runner lowers it to conditional
+            # accept rates); EnginePredictionConfig validates it is non-None
+            # and within [0, nextn] whenever nextn > 0.
+            "nextn": engine.nextn or 0,
+            **({"nextn_accepted": engine.nextn_accepted} if engine.nextn else {}),
         }
     }
     deployment_kwargs: dict[str, Any] = {}
@@ -325,24 +373,9 @@ def _afd_deployment(
         performance_model_metadata=performance_metadata,
         **deployment_kwargs,
     )
-    sample = {
-        "model_name": engine.model,
-        "hardware_sku": engine.hardware,
-        "backend": engine.backend,
-        "backend_version": backend_version,
-        "context_length": (
-            engine.context_length
-            if isinstance(engine.context_length, int)
-            else resolve_model_context_length(engine.model)
-        ),
-        "afd": topology.provenance()["topology"],
-    }
-    return attach_afd_measurements(
-        deployment,
-        sample=sample,
-        workload=workload,
-        performance_model=performance_model,
-    )
+    # No compile-time measurement freeze — the native aic-afd provider
+    # measures at replay time.
+    return deployment
 
 
 def _parallel_mapping(worker: WorkerPredictionConfig, *, prefix: str) -> dict[str, JSONValue]:

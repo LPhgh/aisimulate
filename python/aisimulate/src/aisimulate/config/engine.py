@@ -29,7 +29,16 @@ EngineMode = Literal["aggregated", "disaggregated", "afd"]
 Backend = Literal["vllm", "sglang", "trtllm"]
 KvBytesPerToken = PositiveInt | Literal["auto"]
 AFDPhase = Literal["prefill", "decode", "both"]
-AFDPipelineModel = Literal["optimistic", "conservative", "serial"]
+AFDPipelineModel = Literal[
+    "no_overlap",
+    "partial_overlap",
+    "full_overlap",
+    # Legacy aliases (pre-rename regime names), still accepted for backward
+    # compatibility with existing configs.
+    "optimistic",
+    "conservative",
+    "serial",
+]
 AFDExpertParallel = PositiveInt | Literal["n_f_nodes", "ffn_tp"]
 
 
@@ -44,9 +53,14 @@ class AFDTopologyPredictionConfig(StrictModel):
     a_batch_size: PositiveInt
     f_moe_ep_size: PositiveInt = 1
     num_microbatches: PositiveInt = 3
-    pipeline_model: AFDPipelineModel = "optimistic"
+    pipeline_model: AFDPipelineModel = "full_overlap"
     comm_overhead_factor: PositiveFloat = 1.0
     boundary_on_attn: bool = Field(default=True, strict=True)
+    # Optional per-pool perf-DB systems for heterogeneous A/F SKU pairs.
+    # Omit for homogeneous deployments (both pools inherit the
+    # top-level ``hardware``). Both systems must share the same node width.
+    a_system: str | None = None
+    f_system: str | None = None
 
 
 class AFDSearchRecommendationConfig(StrictModel):
@@ -63,7 +77,7 @@ class AFDSearchRecommendationConfig(StrictModel):
         default_factory=lambda: Choices[PositiveInt](choices=[2, 3, 4])
     )
     pipeline_model: AFDPipelineModel | Choices[AFDPipelineModel] = Field(
-        default_factory=lambda: Choices[AFDPipelineModel](choices=["optimistic", "conservative"])
+        default_factory=lambda: Choices[AFDPipelineModel](choices=["full_overlap", "partial_overlap"])
     )
     comm_overhead_factor: PositiveFloat = 1.0
     boundary_on_attn: bool = Field(default=True, strict=True)
@@ -318,6 +332,17 @@ class KvTransferConfig(StrictModel):
     timing_mode: Literal["full_prompt", "destination_missing"] = "destination_missing"
 
 
+_AFD_UNSUPPORTED_MODEL_CONTROLS = frozenset(
+    {
+        "enable_eplb",
+        "wideep_num_slots",
+        "moe_backend",
+        "moe_kernel_source",
+        "attention_backend",
+    }
+)
+
+
 class EstimatorPolicyConfig(StrictModel):
     nextn: NonNegativeInt = Field(default=0, le=5)
     nextn_accepted: NonNegativeFloat | None = None
@@ -346,11 +371,23 @@ class EstimatorPolicyConfig(StrictModel):
         modes = mode.choices if hasattr(mode, "choices") else [mode]
         if "afd" in modes and self.enable_chunked_prefill is not None:
             raise ValueError("enable_chunked_prefill is unsupported for AFD")
+        if "afd" in modes:
+            # The native AFD path supports nextn (the Rust
+            # SpeculativeDecodeSampler carries acceptance) and the quant-mode
+            # controls (per-pool explicit overrides). Pool-shaping
+            # controls the AFD model does not consume stay rejected.
+            unsupported_afd = [
+                name
+                for name in ENGINE_MODEL_CONTROL_FIELDS
+                if name in _AFD_UNSUPPORTED_MODEL_CONTROLS and is_active_engine_model_control(name, getattr(self, name))
+            ]
+            if unsupported_afd:
+                raise ValueError(f"engine model controls {unsupported_afd} are unsupported for AFD")
+            return self
         workers = getattr(self, "workers", None)
         roles = [getattr(workers, role, None) for role in ("aggregated", "prefill", "decode")]
         if active and (
-            "afd" in modes
-            or getattr(workers, "encoder", None) is not None
+            getattr(workers, "encoder", None) is not None
             or any(worker is not None and worker.timing.type != "default" for worker in roles)
         ):
             raise ValueError("engine model controls require default timing in every regular language role")
@@ -379,8 +416,6 @@ class EstimatorPolicyConfig(StrictModel):
 
     @model_validator(mode="after")
     def _supported_estimator_policies(self):
-        mode = getattr(self, "mode", "aggregated")
-        modes = mode.choices if hasattr(mode, "choices") else [mode]
         workers = getattr(self, "workers", None)
         custom_policy = (
             self.database_mode != "SILICON"
@@ -394,7 +429,13 @@ class EstimatorPolicyConfig(StrictModel):
             or getattr(self, "strict_provenance", None) is not None
         )
         roles = [getattr(workers, role, None) for role in ("aggregated", "prefill", "decode")]
-        unsupported_provider = "afd" in modes or getattr(workers, "encoder", None) is not None
+        # AFD is no longer an unsupported estimator provider — the
+        # native aic-afd timing provider honors database_mode /
+        # transfer_policy / systems_paths / estimation_mode /
+        # fallback_policy / estimator_config through `best_available`
+        # (perfmodel-api's single interface). Encoder pools remain
+        # unsupported.
+        unsupported_provider = getattr(workers, "encoder", None) is not None
         if unsupported_provider and any(
             worker is not None
             and (
@@ -409,8 +450,7 @@ class EstimatorPolicyConfig(StrictModel):
         ):
             raise ValueError("estimator policies require regular language workers with default timing")
         if custom_policy and (
-            "afd" in modes
-            or getattr(workers, "encoder", None) is not None
+            getattr(workers, "encoder", None) is not None
             or any(worker is not None and worker.timing.type != "default" for worker in roles)
         ):
             raise ValueError("estimator policies require regular language workers with default timing in every role")
@@ -738,18 +778,20 @@ def _validate_prediction_afd(engine: EnginePredictionConfig) -> None:
         raise ValueError("engine.mode='afd' requires engine.afd")
     if engine.kv_transfer is not None:
         raise ValueError("AFD mode rejects kv_transfer; A/F transfers are modeled by engine.afd")
-    configured = _configured_worker_roles(engine.workers)
+    if engine.backend != "sglang":
+        raise ValueError(
+            "AFD runs on the continuous SGLang scheduling core and anchors sglang perf data; "
+            f"set engine.backend='sglang' (got {engine.backend!r})"
+        )
     if afd.combined_with_pd:
-        if afd.phase == "both":
-            raise ValueError("AFD+P/D requires phase='prefill' or phase='decode'")
-        companion = "decode" if afd.phase == "prefill" else "prefill"
-        if configured != {companion}:
-            raise ValueError(f"AFD phase={afd.phase!r} combined_with_pd=true requires only workers.{companion}")
-    else:
-        if afd.phase != "both":
-            raise ValueError("pure AFD prediction requires phase='both'; use combined_with_pd=true for one phase")
-        if configured:
-            raise ValueError("pure AFD prediction rejects regular aggregated/prefill/decode workers")
+        raise ValueError(
+            "afd+pd (two-pool prefill/decode handoff) is not supported by the continuous "
+            "SglangCore AFD path yet; use phase='both' with combined_with_pd=false"
+        )
+    if afd.phase != "both":
+        raise ValueError("pure AFD prediction requires phase='both'")
+    if _configured_worker_roles(engine.workers):
+        raise ValueError("pure AFD prediction rejects regular aggregated/prefill/decode workers")
 
 
 def _validate_recommendation_afd(engine: EngineRecommendationConfig) -> None:
@@ -760,19 +802,21 @@ def _validate_recommendation_afd(engine: EngineRecommendationConfig) -> None:
         raise ValueError("engine.mode='afd' requires engine.afd")
     if engine.kv_transfer is not None:
         raise ValueError("AFD mode rejects kv_transfer; A/F transfers are modeled by engine.afd")
-    configured = _configured_worker_roles(engine.workers)
+    backends = set(engine.backend.choices) if isinstance(engine.backend, Choices) else {engine.backend}
+    if backends != {"sglang"}:
+        raise ValueError(
+            "AFD runs on the continuous SGLang scheduling core and anchors sglang perf data; "
+            f"set engine.backend='sglang' (got {sorted(backends)!r})"
+        )
     if afd.combined_with_pd:
-        if afd.phase == "both":
-            raise ValueError("AFD+P/D requires phase='prefill' or phase='decode'")
-        companion = "decode" if afd.phase == "prefill" else "prefill"
-        unexpected = configured - {companion}
-        if unexpected:
-            raise ValueError(f"AFD phase={afd.phase!r} combined_with_pd=true accepts only optional workers.{companion}")
-    else:
-        if afd.phase != "both":
-            raise ValueError("pure AFD recommendation requires phase='both'; use combined_with_pd=true for one phase")
-        if configured:
-            raise ValueError("pure AFD recommendation rejects regular aggregated/prefill/decode workers")
+        raise ValueError(
+            "afd+pd (two-pool prefill/decode handoff) is not supported by the continuous "
+            "SglangCore AFD path yet; use phase='both' with combined_with_pd=false"
+        )
+    if afd.phase != "both":
+        raise ValueError("pure AFD recommendation requires phase='both'")
+    if _configured_worker_roles(engine.workers):
+        raise ValueError("pure AFD recommendation rejects regular aggregated/prefill/decode workers")
 
 
 def _validate_prediction_host_offload(engine: EnginePredictionConfig) -> None:

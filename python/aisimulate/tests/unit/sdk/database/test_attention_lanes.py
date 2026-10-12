@@ -243,11 +243,13 @@ def _route_lane_density_through_the_stub(monkeypatch):
     monkeypatch.setattr(_etv, "fetch_attention_lane_density", _fetch)
 
 
-def test_engine_spec_schema_version_is_twenty_one():
-    """Exact MoE source extends the payload after the schema-20 FPM selector."""
+def test_engine_spec_schema_version_is_twenty_two():
+    """The four AFD comm variants (schema 22) append after the schema-21 MoE
+    source identity; tail-appended variants still bump the version because old
+    binaries cannot read AFD-carrying specs."""
     from aisimulate.sdk import engine
 
-    assert engine.ENGINE_SPEC_SCHEMA_VERSION == 21
+    assert engine.ENGINE_SPEC_SCHEMA_VERSION == 22
 
 
 def test_lanes_outside_the_known_vocabulary_stay_reachable():

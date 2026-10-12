@@ -8,12 +8,15 @@ from pathlib import Path
 
 import pytest
 import yaml
+from pydantic import ValidationError
 
 from aisimulate.config import CoreRecommendationConfig
+from aisimulate.config.engine import EnginePredictionConfig, EngineRecommendationConfig
 from aisimulate.recommend import recommendation_to_sweeper
 from aisimulate.sdk.task_v2 import _build_afd_parallel_lists
 from aisimulate.sweeper import (
     AFDInfeasible,
+    AFDPipelineModel,
     AFDReasonCategory,
     AFDSearchConfig,
     AFDTopology,
@@ -45,12 +48,21 @@ def _topology(**overrides):
         "tp_a": 2,
         "a_batch_size": 64,
         "num_microbatches": 3,
-        "pipeline_model": "optimistic",
-        "phase": "decode",
+        "pipeline_model": "full_overlap",
+        "phase": "both",
         "combined_with_pd": False,
     }
     values.update(overrides)
     return AFDTopology(**values)
+
+
+def test_legacy_pipeline_model_aliases_resolve():
+    # The pre-rename regime strings stay accepted and resolve to the canonical
+    # overlap-based members (frozen goldens and existing configs carry them).
+    assert AFDPipelineModel("serial") is AFDPipelineModel.NO_OVERLAP
+    assert AFDPipelineModel("conservative") is AFDPipelineModel.PARTIAL_OVERLAP
+    assert AFDPipelineModel("optimistic") is AFDPipelineModel.FULL_OVERLAP
+    assert _topology(pipeline_model="optimistic").pipeline_model is AFDPipelineModel.FULL_OVERLAP
 
 
 def test_documented_afd_migration_contract_is_well_formed():
@@ -65,10 +77,10 @@ def test_documented_afd_migration_contract_is_well_formed():
         "mode": "afd",
         "model": "Qwen/Qwen3-32B",
         "hardware": "h200_sxm",
-        "backend": "trtllm",
+        "backend": "sglang",
         "afd": {
-            "phase": "decode",
-            "combined_with_pd": True,
+            "phase": "both",
+            "combined_with_pd": False,
             "a_batch_size": 128,
         },
     }
@@ -88,8 +100,8 @@ def test_documented_afd_migration_contract_lowers_to_sweeper():
 
     lowered = recommendation_to_sweeper(config)
 
-    assert lowered.search_space.deployment_mode == ["afd+pd"]
-    assert lowered.search_space.afd_phase == "decode"
+    assert lowered.search_space.deployment_mode == ["afd"]
+    assert lowered.search_space.afd_phase == "both"
     assert lowered.search_space.afd_batch_size_candidates == [128]
 
 
@@ -170,7 +182,7 @@ def test_moe_domain_resolves_symbolic_ep_and_filters_expert_divisibility():
             tp_a_candidates=(8,),
             f_moe_ep_size_candidates=(3, "n_f_nodes", "ffn_tp"),
             microbatch_candidates=(3,),
-            pipeline_model_candidates=("optimistic",),
+            pipeline_model_candidates=("full_overlap",),
         )
     )
 
@@ -198,7 +210,7 @@ def test_moe_domain_resolves_symbolic_ep_and_filters_expert_divisibility():
             "tp_a_list": [8],
             "f_moe_ep_size_list": [3, "n_f_nodes", "tp_f"],
             "microbatch_list": [3],
-            "pipeline_model_list": ["optimistic"],
+            "pipeline_model_list": ["full_overlap"],
         },
     )
     assert actual == expected
@@ -270,7 +282,7 @@ def test_dense_search_accepts_explicit_single_expert_parallelism():
         ("a_batch_size_candidates", (64, 64)),
         ("f_moe_ep_size_candidates", (1, 1)),
         ("microbatch_candidates", (3, 3)),
-        ("pipeline_model_candidates", ("serial", "serial")),
+        ("pipeline_model_candidates", ("no_overlap", "no_overlap")),
     ],
 )
 def test_search_rejects_duplicate_explicit_candidates(field, values):
@@ -362,7 +374,10 @@ def test_pinned_domain_accepts_budget_with_partial_node_remainder():
     ("topology_overrides", "config_overrides", "field"),
     [
         ({"phase": "prefill"}, {}, "phase"),
-        ({"combined_with_pd": False}, {}, "combined_with_pd"),
+        # Flip the SEARCH side, not the topology side: AFDTopology rejects
+        # phase="both" + combined_with_pd=True at construction, which happens
+        # outside the pytest.raises block below.
+        ({"combined_with_pd": False}, {"combined_with_pd": True}, "combined_with_pd"),
         ({"comm_overhead_factor": 2.0}, {}, "comm_overhead_factor"),
         ({"boundary_on_attn": False}, {}, "boundary_on_attn"),
     ],
@@ -416,7 +431,7 @@ def test_generated_domain_applies_minimum_budget_and_inclusive_af_ratio():
             tp_a_candidates=(8,),
             a_batch_size_candidates=(1,),
             microbatch_candidates=(3,),
-            pipeline_model_candidates=("serial",),
+            pipeline_model_candidates=("no_overlap",),
             max_af_ratio=1.0,
         )
     )
@@ -443,7 +458,7 @@ def test_generated_domain_treats_total_gpus_as_an_upper_bound(total_gpus, expect
             tp_a_candidates=(8,),
             a_batch_size_candidates=(1,),
             microbatch_candidates=(3,),
-            pipeline_model_candidates=("serial",),
+            pipeline_model_candidates=("no_overlap",),
         )
     )
 
@@ -456,3 +471,83 @@ def test_generated_domain_treats_total_gpus_as_an_upper_bound(total_gpus, expect
         "usable_gpus": max(expected_gpu_counts),
         "remainder_gpus": remainder_gpus,
     }
+
+
+def _afd_topology_payload(**overrides):
+    payload = {
+        "phase": "both",
+        "combined_with_pd": False,
+        "n_a_nodes": 1,
+        "n_f_nodes": 1,
+        "tp_a": 8,
+        "a_batch_size": 32,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_pure_afd_prediction_accepts_sglang_phase_both():
+    config = EnginePredictionConfig(
+        model="Qwen/Qwen3-32B",
+        hardware="h200_sxm",
+        mode="afd",
+        backend="sglang",
+        afd=_afd_topology_payload(),
+    )
+    assert config.afd is not None and config.afd.phase == "both"
+
+
+@pytest.mark.parametrize("backend", ["vllm", "trtllm"])
+def test_afd_prediction_rejects_non_sglang_backend(backend):
+    with pytest.raises(ValidationError, match="continuous SGLang scheduling core"):
+        EnginePredictionConfig(
+            model="Qwen/Qwen3-32B",
+            hardware="h200_sxm",
+            mode="afd",
+            backend=backend,
+            afd=_afd_topology_payload(),
+        )
+
+
+def test_afd_prediction_rejects_combined_with_pd():
+    with pytest.raises(ValidationError, match="two-pool prefill/decode handoff"):
+        EnginePredictionConfig(
+            model="Qwen/Qwen3-32B",
+            hardware="h200_sxm",
+            mode="afd",
+            backend="sglang",
+            afd=_afd_topology_payload(phase="decode", combined_with_pd=True),
+        )
+
+
+def test_afd_prediction_rejects_single_phase_without_companion():
+    with pytest.raises(ValidationError, match="phase='both'"):
+        EnginePredictionConfig(
+            model="Qwen/Qwen3-32B",
+            hardware="h200_sxm",
+            mode="afd",
+            backend="sglang",
+            afd=_afd_topology_payload(phase="prefill"),
+        )
+
+
+def test_afd_recommendation_applies_the_same_gates():
+    base = {
+        "model": "Qwen/Qwen3-32B",
+        "hardware": "h200_sxm",
+        "mode": "afd",
+        "afd": {"phase": "both", "combined_with_pd": False, "a_batch_size": 32},
+    }
+    accepted = EngineRecommendationConfig(**base, backend="sglang")
+    assert accepted.afd is not None
+    with pytest.raises(ValidationError, match="continuous SGLang scheduling core"):
+        # The default backend domain ("vllm", "sglang") is not the pinned sglang anchor.
+        EngineRecommendationConfig(**base)
+    with pytest.raises(ValidationError, match="two-pool prefill/decode handoff"):
+        EngineRecommendationConfig(
+            **{
+                **base,
+                "afd": {"phase": "decode", "combined_with_pd": True, "a_batch_size": 32},
+            },
+            backend="sglang",
+        )

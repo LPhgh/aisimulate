@@ -30,16 +30,14 @@ def _mapping(value: Any, path: str) -> Mapping[str, Any]:
     return value
 
 
-def _positive_int(value: Any, path: str) -> int:
-    if type(value) is not int or value < 1:
-        raise AFDQualificationError(f"{path} must be a positive integer")
-    return value
-
-
 def _topology_from_deployment(spec: ReplaySpec) -> tuple[AFDTopology, Mapping[str, Any]]:
     deployment = spec.backend_deployment
-    if deployment.deployment_mode not in {"afd", "afd+pd"}:
-        raise AFDQualificationError("AFD qualification artifacts require deployment_mode 'afd' or 'afd+pd'")
+    if deployment.deployment_mode != "afd":
+        raise AFDQualificationError(
+            "AFD qualification covers deployment_mode='afd' (phase='both' pure AFD pool) only; "
+            "afd+pd (two-pool prefill/decode handoff) is not supported by the continuous "
+            "SglangCore AFD path yet"
+        )
     if deployment.encoder is not None or spec.workload.get("images") is not None:
         raise AFDQualificationError("AFD qualification does not support analytical EPD encoder pools or images")
     if spec.api_version != REPLAY_SPEC_API_VERSION:
@@ -67,7 +65,13 @@ def _topology_from_deployment(spec: ReplaySpec) -> tuple[AFDTopology, Mapping[st
     missing = topology_fields - set(raw_topology)
     if missing:
         raise AFDQualificationError(f"parallel_config.afd is missing required fields {sorted(missing)}")
-    topology = AFDTopology(**{name: raw_topology[name] for name in topology_fields})
+    # a_system/f_system are optional (hetero): absent means
+    # homogeneous (the deployment's top-level hardware).
+    optional_fields = ("a_system", "f_system")
+    topology = AFDTopology(
+        **{name: raw_topology[name] for name in topology_fields},
+        **{name: raw_topology[name] for name in optional_fields if raw_topology.get(name) is not None},
+    )
     if raw_topology.get("ffn_tp") != topology.ffn_tp:
         raise AFDQualificationError("parallel_config.afd.ffn_tp is inconsistent with the F pool")
     if topology.adapter_topology != deployment.deployment_mode:
@@ -90,6 +94,19 @@ def _validate_measurements(spec: ReplaySpec, topology: AFDTopology) -> Mapping[s
         spec.backend_deployment.performance_model_metadata.get("afd"),
         "performance_model_metadata.afd",
     )
+    provider = metadata.get("provider")
+    if provider == "aic-afd":
+        # The native aic-afd provider measures at replay time; no
+        # compile-time frozen measurements exist. The qualification contract
+        # is the provider identity plus the per-pool systems.
+        if metadata.get("measurement_required") is not False:
+            raise AFDQualificationError("aic-afd AFD deployments must set measurement_required=False")
+        return metadata
+    # Legacy frozen-measurement contract. Production emits "aic-afd" (see
+    # compiler._afd_deployment / deploy.build_backend_deployment), so the
+    # success path below is exercised ONLY by the trtllm fixture in
+    # tests/test_afd_artifacts.py and tests/golden/afd-qualification.json;
+    # retiring this branch means migrating both.
     if metadata.get("measurement_required") is not False:
         raise AFDQualificationError("AFD qualification requires resolved layer measurements")
     measurements = metadata.get("measurements")
@@ -108,46 +125,6 @@ def _validate_measurements(spec: ReplaySpec, topology: AFDTopology) -> Mapping[s
     return metadata
 
 
-def _companion_plan(
-    spec: ReplaySpec,
-    provenance: Mapping[str, Any],
-) -> dict[str, JSONValue] | None:
-    deployment = spec.backend_deployment
-    role = provenance.get("companion_role")
-    if deployment.deployment_mode == "afd":
-        if role is not None or provenance.get("companion") is not None:
-            raise AFDQualificationError("pure AFD cannot contain a P/D companion")
-        return None
-    if role not in {"prefill", "decode"}:
-        raise AFDQualificationError("AFD+P/D requires one prefill or decode companion")
-
-    prefix = f"{role}_"
-    workers = deployment.num_prefill_workers if role == "prefill" else deployment.num_decode_workers
-    engine_args = deployment.prefill_engine_args if role == "prefill" else deployment.decode_engine_args
-    if workers < 1 or engine_args is None:
-        raise AFDQualificationError(f"AFD+P/D {role} companion is not fully materialized")
-    names = ("tp", "pp", "attention_dp", "moe_tp", "moe_ep", "strategy", "replicas")
-    missing = [name for name in names if f"{prefix}{name}" not in deployment.parallel_config]
-    if missing:
-        raise AFDQualificationError(f"AFD+P/D {role} companion is missing parallel fields {missing}")
-    parallel = {name: deployment.parallel_config[f"{prefix}{name}"] for name in names}
-    if _positive_int(parallel["replicas"], f"parallel_config.{prefix}replicas") != workers:
-        raise AFDQualificationError(f"AFD+P/D {role} worker count does not match its parallel config")
-    companion_gpus = (
-        _positive_int(parallel["tp"], f"parallel_config.{prefix}tp")
-        * _positive_int(parallel["pp"], f"parallel_config.{prefix}pp")
-        * _positive_int(parallel["attention_dp"], f"parallel_config.{prefix}attention_dp")
-        * workers
-    )
-    return {
-        "role": str(role),
-        "workers": workers,
-        "gpus": companion_gpus,
-        "parallelism": parallel,
-        "engine_args": dict(engine_args),
-    }
-
-
 def build_afd_qualification(spec: ReplaySpec) -> dict[str, JSONValue]:
     """Build and validate a logical A/F pool plan for analytical replay.
 
@@ -158,14 +135,17 @@ def build_afd_qualification(spec: ReplaySpec) -> dict[str, JSONValue]:
 
     topology, provenance = _topology_from_deployment(spec)
     measurement_metadata = _validate_measurements(spec, topology)
-    companion = _companion_plan(spec, provenance)
+    # afd+pd is rejected above, so companion provenance can only be stale.
+    if provenance.get("companion_role") is not None or provenance.get("companion") is not None:
+        raise AFDQualificationError("pure AFD cannot contain a P/D companion")
     accounting = _mapping(provenance.get("gpu_accounting"), "afd_provenance.gpu_accounting")
-    expected_companion_gpus = 0 if companion is None else int(companion["gpus"])
     expected_accounting = {
         "attention_gpus": topology.attention_gpus,
         "ffn_gpus": topology.ffn_gpus,
-        "companion_gpus": expected_companion_gpus,
-        "total_gpus": topology.total_gpus + expected_companion_gpus,
+        # The companion slot stays in the schema as a constant so the artifact
+        # shape does not shift when the two-pool handoff lands.
+        "companion_gpus": 0,
+        "total_gpus": topology.total_gpus,
     }
     if dict(accounting) != expected_accounting:
         raise AFDQualificationError(
@@ -215,7 +195,7 @@ def build_afd_qualification(spec: ReplaySpec) -> dict[str, JSONValue]:
                     "tensor_parallel_size": topology.ffn_tp,
                     "moe_expert_parallel_size": topology.f_moe_ep_size,
                 },
-                "companion": companion,
+                "companion": None,
             },
             "gpu_accounting": expected_accounting,
             "launch": {
@@ -234,7 +214,7 @@ def build_afd_qualification(spec: ReplaySpec) -> dict[str, JSONValue]:
 def write_afd_qualification_artifacts(root: Path, spec: ReplaySpec) -> tuple[Path, Path] | None:
     """Write AFD replay and qualification artifacts, or return ``None`` for other modes."""
 
-    if spec.backend_deployment.deployment_mode not in {"afd", "afd+pd"}:
+    if spec.backend_deployment.deployment_mode != "afd":
         return None
     qualification = build_afd_qualification(spec)
     replay_path = root / AFD_REPLAY_SPEC_FILENAME

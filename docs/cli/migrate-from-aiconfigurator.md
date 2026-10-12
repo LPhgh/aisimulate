@@ -756,10 +756,10 @@ engine:
   mode: afd
   model: Qwen/Qwen3-32B
   hardware: h200_sxm
-  backend: trtllm
+  backend: sglang
   afd:
-    phase: decode
-    combined_with_pd: true
+    phase: both
+    combined_with_pd: false
     a_batch_size: 128
 
 evaluation:

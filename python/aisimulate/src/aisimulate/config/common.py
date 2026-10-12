@@ -220,6 +220,38 @@ def split_config_sections(
 
 
 # Engine identity controls forwarded unchanged to the canonical Core constructor.
+AFD_NATIVE_ENV = "AISIMULATE_AFD_NATIVE"
+
+
+def require_native_afd() -> None:
+    """Assert the native AFD path; reject every retired or unknown switch value.
+
+    ``AISIMULATE_AFD_NATIVE`` defaults to ``"1"``: AFD runs through the standard
+    ``run_replay_json`` path on the monolithic SGLang scheduling core with the
+    ``aic-afd`` timing provider injected. ``"0"`` selected the Python island and
+    ``"shadow"`` the dual-run comparison; both were removed in the
+    migration, so they fail loudly rather than being silently ignored.
+    """
+
+    import os
+
+    mode = os.environ.get(AFD_NATIVE_ENV, "1").strip().lower()
+    if mode in {"", "1"}:
+        return
+    if mode == "0":
+        raise RuntimeError(
+            f"{AFD_NATIVE_ENV}=0 requested the Python AFD island, which was "
+            "removed in the AFD Rust migration — use the native "
+            "path (the default) instead"
+        )
+    raise RuntimeError(
+        f"{AFD_NATIVE_ENV}={mode!r} is not a recognized value; the only accepted "
+        'setting is "1" (the default native path), or leave it unset. The historical '
+        '"0" (Python island) and "shadow" (dual-run comparison) modes were removed '
+        "in the AFD Rust migration."
+    )
+
+
 ENGINE_MODEL_CONTROL_FIELDS = (
     "enable_eplb",
     "wideep_num_slots",

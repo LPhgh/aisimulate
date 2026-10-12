@@ -47,7 +47,7 @@ def _spec(*, combined_with_pd: bool = False, afd_phase: str = "decode") -> Repla
         a_batch_size=64,
         f_moe_ep_size=1,
         num_microbatches=4,
-        pipeline_model="conservative",
+        pipeline_model="partial_overlap",
         phase=afd_phase if combined_with_pd else "both",
         combined_with_pd=combined_with_pd,
         is_moe=False,
@@ -125,38 +125,20 @@ def test_pure_afd_qualification_matches_golden() -> None:
     assert rendered == golden.read_text(encoding="utf-8")
 
 
-def test_afd_plus_pd_qualification_preserves_companion_and_gpu_accounting() -> None:
-    artifact = build_afd_qualification(_spec(combined_with_pd=True))
+def test_afd_plus_pd_qualification_is_rejected_loudly() -> None:
+    # The two-pool prefill/decode handoff is fail-loud future work on the
+    # continuous SglangCore path, so neither companion role qualifies and the
+    # companion slot in the artifact schema stays a constant null/0.
+    for kwargs in (
+        {"combined_with_pd": True},
+        {"combined_with_pd": True, "afd_phase": "prefill"},
+    ):
+        with pytest.raises(AFDQualificationError, match="two-pool prefill/decode handoff"):
+            build_afd_qualification(_spec(**kwargs))
 
-    companion = artifact["deployment_plan"]["pools"]["companion"]
-    assert companion == {
-        "role": "prefill",
-        "workers": 2,
-        "gpus": 4,
-        "parallelism": {
-            "tp": 2,
-            "pp": 1,
-            "attention_dp": 1,
-            "moe_tp": 1,
-            "moe_ep": 1,
-            "strategy": "tp",
-            "replicas": 2,
-        },
-        "engine_args": {
-            "worker_type": "prefill",
-            "timing_model": {"type": "fixed", "prefill_ms": 5.0},
-        },
-    }
-    assert artifact["deployment_plan"]["gpu_accounting"]["total_gpus"] == 20
-
-
-def test_afd_plus_pd_qualification_supports_decode_companion() -> None:
-    artifact = build_afd_qualification(_spec(combined_with_pd=True, afd_phase="prefill"))
-
-    companion = artifact["deployment_plan"]["pools"]["companion"]
-    assert companion["role"] == "decode"
-    assert companion["workers"] == 2
-    assert companion["engine_args"]["worker_type"] == "decode"
+    artifact = build_afd_qualification(_spec())
+    assert artifact["deployment_plan"]["pools"]["companion"] is None
+    assert artifact["deployment_plan"]["gpu_accounting"]["companion_gpus"] == 0
 
 
 def test_qualification_rejects_unresolved_measurements() -> None:
@@ -167,6 +149,19 @@ def test_qualification_rejects_unresolved_measurements() -> None:
     )
 
     with pytest.raises(AFDQualificationError, match="resolved layer measurements"):
+        build_afd_qualification(replace(spec, backend_deployment=deployment))
+
+
+def test_qualification_rejects_aic_afd_without_measurement_required_false() -> None:
+    # Production emits provider="aic-afd" (compiler._afd_deployment /
+    # deploy.build_backend_deployment); that branch still pins the flag.
+    spec = _spec()
+    deployment = replace(
+        spec.backend_deployment,
+        performance_model_metadata={"afd": {"provider": "aic-afd", "measurement_required": True}},
+    )
+
+    with pytest.raises(AFDQualificationError, match="measurement_required=False"):
         build_afd_qualification(replace(spec, backend_deployment=deployment))
 
 

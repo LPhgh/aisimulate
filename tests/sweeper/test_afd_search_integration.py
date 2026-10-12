@@ -6,21 +6,18 @@
 import pytest
 from pydantic import ValidationError
 
-from aisimulate.runner import EngineReplayRunnerFactory
 from aisimulate.sweeper.afd_parallel import (
     AFDInfeasible,
     AFDParallelConfig,
     AFDReasonCategory,
 )
-from aisimulate.sweeper.afd_perfmodel import AFDLayerTimes
 from aisimulate.sweeper.config import SmartSearchConfig
 from aisimulate.sweeper.deploy import build_backend_deployment
 from aisimulate.sweeper.model_hw import ModelHardware, NoViableParallelConfig
 from aisimulate.sweeper.parallel_enum import ParallelShape, ReplicaParallelConfig
-from aisimulate.sweeper.replay import ReplayReport, ReplaySpec, RunnerCapabilities
+from aisimulate.sweeper.replay import RunnerCapabilities
 from aisimulate.sweeper.sample import unroll_sample
 from aisimulate.sweeper.sampler import RandomBranchSampler
-from aisimulate.sweeper.search import Sweeper
 from aisimulate.sweeper.search_space import RunnerIncompatibleError, enumerate_branches
 
 
@@ -47,11 +44,11 @@ def _topology(*, n_a_nodes: int = 1, n_f_nodes: int = 1) -> dict:
         "tp_a": 2,
         "a_batch_size": 16,
         "num_microbatches": 3,
-        "pipeline_model": "optimistic",
+        "pipeline_model": "full_overlap",
     }
 
 
-@pytest.mark.parametrize("mode", ["afd", "afd+pd"])
+@pytest.mark.parametrize("mode", ["afd"])
 def test_afd_rejects_chunked_prefill_control(mode):
     with pytest.raises(ValidationError, match="enable_chunked_prefill is unsupported for AFD"):
         _config(mode, enable_chunked_prefill=True)
@@ -62,7 +59,7 @@ def _config(mode: str, **search_overrides) -> SmartSearchConfig:
         "model_name": "example/model",
         "hardware_sku": "example_sku",
         "deployment_mode": [mode],
-        "backend": ["vllm"],
+        "backend": ["sglang"],
         "gpu_budget": 16,
         "afd_pinned_topologies": [_topology()],
     }
@@ -74,7 +71,7 @@ def _config(mode: str, **search_overrides) -> SmartSearchConfig:
 
 
 def _capabilities(mode: str) -> RunnerCapabilities:
-    return RunnerCapabilities(supported_backend_topologies=(("vllm", mode),))
+    return RunnerCapabilities(supported_backend_topologies=(("sglang", mode),))
 
 
 def test_pure_afd_uses_finite_generic_sampler_and_serializes_no_engine(monkeypatch):
@@ -107,59 +104,19 @@ def test_pure_afd_uses_finite_generic_sampler_and_serializes_no_engine(monkeypat
     assert deployment.prefill_engine_args is None
     assert deployment.decode_engine_args is None
     assert deployment.num_workers == 0
-    assert deployment.performance_model_metadata["afd"]["provider"] == "unresolved"
-    assert deployment.performance_model_metadata["afd"]["measurement_required"] is True
+    assert deployment.performance_model_metadata["afd"]["provider"] == "aic-afd"
+    assert deployment.performance_model_metadata["afd"]["measurement_required"] is False
 
 
-def test_afd_plus_pd_pairs_only_opposite_phase_companion(monkeypatch):
-    companion = ReplicaParallelConfig(
-        shape=ParallelShape(tp=4, dp=1, moe_tp=1, moe_ep=1),
-        replicas=1,
-    )
-    monkeypatch.setattr(
-        "aisimulate.sweeper.search_space.resolve_model_hardware",
-        lambda *args, **kwargs: _model_hardware(),
-    )
-    calls = []
-
-    def fake_parallel_configs(*args, **kwargs):
-        calls.append(kwargs)
-        return [companion]
-
-    monkeypatch.setattr(
-        "aisimulate.sweeper.search_space.parallel_configs_for",
-        fake_parallel_configs,
-    )
-    config = _config(
-        "afd+pd",
-        afd_phase="decode",
-        afd_companion_parallel_configs=[{"tp": 4}],
-        prefill_max_num_batched_tokens=[4096],
-        prefill_max_num_seqs=[8],
-    )
-
-    (branch,) = enumerate_branches(config, runner_capabilities=_capabilities("afd+pd"))
-    suggestion = RandomBranchSampler(branch, seed=3).suggest(1)[0]
-    sample = unroll_sample(
-        search_space=config.search_space,
-        selection=suggestion.selection,
-        parallel_config=suggestion.parallel_config,
-    )
-    deployment = build_backend_deployment(sample, backend_version="test")
-
-    assert calls[0]["deployment_mode"] == "agg"
-    assert calls[0]["role_runtime"] == {"agg": (4096, 8, 0.9, None)}
-    assert suggestion.parallel_config.companion_role == "prefill"
-    assert sample["used_gpus"] == 12
-    assert deployment.num_prefill_workers == 1
-    assert deployment.prefill_engine_args["worker_type"] == "prefill"
-    assert deployment.decode_engine_args is None
-    assert "decode_tp" not in deployment.parallel_config
+def test_afd_plus_pd_is_rejected_loudly_at_config_validation():
+    # afd+pd two-pool handoff is retired on the continuous path (future work);
+    # the search config must fail loud instead of silently degrading.
+    with pytest.raises(ValidationError, match="two-pool prefill/decode handoff"):
+        _config("afd+pd", afd_phase="decode")
 
 
-@pytest.mark.parametrize("mode", ["afd", "afd+pd"])
 @pytest.mark.parametrize("pinned", [False, True])
-def test_afd_runner_capability_gate_fails_closed(monkeypatch, mode, pinned):
+def test_afd_runner_capability_gate_fails_closed(monkeypatch, pinned):
     def unexpected_model_lookup(*args, **kwargs):
         pytest.fail("runner-incompatible AFD must be rejected before model lookup")
 
@@ -168,10 +125,10 @@ def test_afd_runner_capability_gate_fails_closed(monkeypatch, mode, pinned):
         unexpected_model_lookup,
     )
 
-    with pytest.raises(RunnerIncompatibleError, match=r"runner-incompatible backends=\['vllm'\]"):
+    with pytest.raises(RunnerIncompatibleError, match=r"runner-incompatible backends=\['sglang'\]"):
         enumerate_branches(
-            _config(mode, afd_pinned_topologies=[_topology()] if pinned else [], afd_batch_size_candidates=[16]),
-            runner_capabilities=RunnerCapabilities(supported_backend_topologies=(("vllm", "agg"),)),
+            _config("afd", afd_pinned_topologies=[_topology()] if pinned else [], afd_batch_size_candidates=[16]),
+            runner_capabilities=RunnerCapabilities(supported_backend_topologies=(("sglang", "agg"),)),
         )
 
 
@@ -246,7 +203,7 @@ def test_afd_complete_domain_limit_fails_instead_of_truncating(monkeypatch):
         afd_tp_a_candidates=[1],
         afd_batch_size_candidates=[1],
         afd_microbatch_candidates=[3],
-        afd_pipeline_model_candidates=["serial"],
+        afd_pipeline_model_candidates=["no_overlap"],
         afd_max_candidates=2,
     )
 
@@ -256,156 +213,24 @@ def test_afd_complete_domain_limit_fails_instead_of_truncating(monkeypatch):
     assert exc_info.value.category is AFDReasonCategory.CANDIDATE_LIMIT
 
 
-def test_afd_combined_product_limit_fails_during_generation(monkeypatch):
-    companions = [
-        ReplicaParallelConfig(
-            shape=ParallelShape(tp=tp, dp=1, moe_tp=1, moe_ep=1),
-            replicas=1,
-        )
-        for tp in (1, 2, 4)
-    ]
-    monkeypatch.setattr(
-        "aisimulate.sweeper.search_space.resolve_model_hardware",
-        lambda *args, **kwargs: _model_hardware(),
-    )
-    monkeypatch.setattr(
-        "aisimulate.sweeper.search_space.parallel_configs_for",
-        lambda *args, **kwargs: companions,
-    )
-    config = _config("afd+pd", afd_max_candidates=2)
-
-    with pytest.raises(AFDInfeasible) as exc_info:
-        enumerate_branches(config, runner_capabilities=_capabilities("afd+pd"))
-
-    assert exc_info.value.category is AFDReasonCategory.CANDIDATE_LIMIT
-    assert exc_info.value.provenance == {
-        "generated_count": 3,
-        "count_is_lower_bound": True,
-    }
-
-
-def test_sweeper_runs_afd_branch_through_an_explicitly_capable_runner(monkeypatch):
-    monkeypatch.setattr(
-        "aisimulate.sweeper.search_space.resolve_model_hardware",
-        lambda *args, **kwargs: _model_hardware(),
-    )
-    monkeypatch.setattr(
-        "aisimulate.sweeper.search.resolve_backend_version",
-        lambda *args, **kwargs: "test",
-    )
-
-    class Runner:
-        def __init__(self):
-            self.specs: list[ReplaySpec] = []
-
-        def run(self, spec: ReplaySpec, *, output_requirements=None) -> ReplayReport:
-            self.specs.append(spec)
-            return ReplayReport(metrics={"output_throughput_tok_s": 10.0, "gpu_hours": 1.0})
-
-        def close(self) -> None:
-            pass
-
-    class Factory:
-        def __init__(self):
-            self.runner = Runner()
-
-        def capabilities(self) -> RunnerCapabilities:
-            return _capabilities("afd")
-
-        def create(self, worker_id: int) -> Runner:
-            return self.runner
-
-    class PerformanceModel:
-        def measure(self, request):
-            phases = (
-                ("prefill", "decode") if request.topology.phase.value == "both" else (request.topology.phase.value,)
-            )
-            return tuple(
-                AFDLayerTimes(
-                    phase=phase,
-                    attention_ms=1.0,
-                    ffn_ms=2.0,
-                    a_to_f_ms=0.1,
-                    f_to_a_ms=0.2,
-                    num_layers=32,
-                    provenance={"provider": "test"},
-                )
-                for phase in phases
-            )
-
-    factory = Factory()
-    config = _config("afd")
-    config.sweep.max_rounds = 1
-    config.sweep.candidates_per_round = 1
-    config.sweep.parallel_evals = 1
-    config.sweep.algorithm = "random"
-
-    result = Sweeper(
-        runner_factory=factory,
-        afd_performance_model=PerformanceModel(),
-        show_progress=False,
-    ).run(config, top_n=None)
-
-    assert len(result.selected_candidates) == 1
-    assert result.selected_candidates[0].used_gpus == 8
-    assert factory.runner.specs[0].backend_deployment.deployment_mode == "afd"
-    assert factory.runner.specs[0].backend_deployment.agg_engine_args is None
-    assert factory.runner.specs[0].backend_deployment.performance_model_metadata["afd"]["provider"] == "test"
-
-
-def test_sweeper_runs_pure_both_phase_afd_through_engine_runner(monkeypatch):
-    monkeypatch.setattr(
-        "aisimulate.sweeper.search_space.resolve_model_hardware",
-        lambda *args, **kwargs: _model_hardware(),
-    )
-    monkeypatch.setattr(
-        "aisimulate.sweeper.search.resolve_backend_version",
-        lambda *args, **kwargs: "test",
-    )
-
-    class PerformanceModel:
-        def measure(self, request):
-            return tuple(
-                AFDLayerTimes(
-                    phase=phase,
-                    attention_ms=1.0,
-                    ffn_ms=1.0,
-                    a_to_f_ms=0.0,
-                    f_to_a_ms=0.0,
-                    num_layers=1,
-                    provenance={"provider": "test"},
-                )
-                for phase in ("prefill", "decode")
-            )
-
-    config = _config("afd", afd_phase="both")
-    config.sweep.max_rounds = 1
-    config.sweep.candidates_per_round = 1
-    config.sweep.parallel_evals = 1
-    config.sweep.algorithm = "random"
-
-    result = Sweeper(
-        runner_factory=EngineReplayRunnerFactory(),
-        afd_performance_model=PerformanceModel(),
-        show_progress=False,
-    ).run(config, top_n=None)
-
-    assert result.counts.feasible == 1
-    assert result.selected_candidates[0].metrics["completed_requests"] == 16.0
-    assert result.selected_candidates[0].metrics["output_throughput_tok_s"] > 0.0
+def test_afd_combined_product_limit_is_retired_with_afd_plus_pd():
+    # The companion product enumeration was afd+pd-only; with the mode
+    # retired, the config gate fires before any candidate generation.
+    with pytest.raises(ValidationError, match="two-pool prefill/decode handoff"):
+        _config("afd+pd", afd_max_candidates=2)
 
 
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
-        ({"deployment_mode": ["afd"]}, "memory-qualified afd_batch_size_candidates"),
+        ({"deployment_mode": ["afd"], "backend": ["sglang"]}, "memory-qualified afd_batch_size_candidates"),
         (
             {
                 "deployment_mode": ["afd+pd"],
                 "afd_phase": "both",
                 "afd_batch_size_candidates": [1],
             },
-            "requires afd_phase prefill or decode",
+            "two-pool prefill/decode handoff",
         ),
     ],
 )

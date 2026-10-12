@@ -76,6 +76,177 @@ fn direct_request(tokens: Vec<u32>, max_output_tokens: usize) -> DirectRequest {
 }
 
 #[rstest::rstest]
+#[case::tiny(1)]
+#[case::huge(1 << 20)]
+fn prefill_admission_caps_at_max_running_requests_ignoring_batched_tokens(
+    #[case] max_num_batched_tokens: usize,
+) {
+    // `max_running_requests` (= `max_num_seqs`) is the hard in-flight cap for
+    // continuous AFD admission; `max_num_batched_tokens` is not consulted by
+    // the SGLang prefill path (only `max_prefill_tokens` /
+    // `chunked_prefill_size` and the radix memory reserve gate admission).
+    let mut args = test_args(64, 4, 64);
+    args.max_num_seqs = Some(2);
+    args.max_num_batched_tokens = Some(max_num_batched_tokens);
+    let mut core = SglangCore::new(args);
+    for index in 0..4u128 {
+        let mut request = direct_request(vec![1, 2, 3, 4], 8);
+        request.uuid = Some(Uuid::from_u128(index + 1));
+        core.receive(request);
+    }
+    let pass = core.execute_hidden_pass(0.0);
+    assert_eq!(
+        pass.admissions.len(),
+        2,
+        "max_num_batched_tokens={max_num_batched_tokens} must not change the admission cap"
+    );
+    assert_eq!(core.running.len(), 2);
+    assert_eq!(core.waiting.len(), 2);
+}
+
+#[test]
+fn continuous_afd_derivation_keeps_max_num_seqs_as_the_only_binding_limit() {
+    // The derivation `_materialize_afd_engine_role` emits for
+    // crates/core/parity_tests/perfmodel/configs/afd-predict-pure.yaml, whose
+    // `context_length: max` resolves to 40960 for Qwen/Qwen3-32B:
+    //   max_num_seqs   = n_a_workers (1*8/8) * a_batch_size (18) = 18
+    //   prompt_window  = kv_window = 40960
+    //   num_gpu_blocks = ceil(18 * 40960 * 1.25) = 921_600
+    // Concurrency 24 exceeds the in-flight cap, so this is the saturated side
+    // of the admission boundary.
+    let mut args = test_args(921_600, 1, 40_960);
+    args.max_num_seqs = Some(18);
+    // `max_prefill_tokens` MUST be set explicitly: SglangConfig's default is
+    // 16_384 (sglang/config.rs), which would cap this pass at 16 of the 18
+    // 1024-token prompts and make max_num_seqs look non-binding for the wrong
+    // reason. `test_args` only wires page_size and chunked_prefill_size.
+    args.sglang
+        .as_mut()
+        .expect("sglang args")
+        .max_prefill_tokens = Some(40_960);
+    let mut core = SglangCore::new(args);
+    for index in 0..24u128 {
+        let mut request = direct_request(vec![(index + 1) as u32; 1024], 128);
+        request.uuid = Some(Uuid::from_u128(index + 1));
+        core.receive(request);
+    }
+
+    let pass = core.execute_hidden_pass(0.0);
+    // G1: the radix memory reserve does not bind below max_num_seqs.
+    assert_eq!(
+        pass.admissions.len(),
+        18,
+        "max_num_seqs must be the only binding admission limit"
+    );
+    // G2: every admitted 1024-token prompt pre-fills in ONE pass, so the AFD
+    // timing identity's "one frozen prefill step per pass" holds.
+    for admission in &pass.admissions {
+        assert_eq!(
+            admission.reused_input_tokens, 0,
+            "no prefix sharing expected"
+        );
+    }
+    assert_eq!(core.running.len(), 18);
+    assert_eq!(core.waiting.len(), 6);
+    assert!(pass.pressure_events.is_empty());
+
+    // Drive every request to completion: retraction must never fire at the
+    // derived capacity, because num_gpu_blocks carries the 1.25 headroom that
+    // covers SGLang's strict-fit comparison plus the new_token_ratio output
+    // reservation for all 18 in-flight sequences.
+    let mut now_ms = pass.end_ms;
+    let mut completed = pass
+        .output_signals
+        .iter()
+        .filter(|signal| signal.completed)
+        .count();
+    for _ in 0..4096 {
+        if completed == 24 {
+            break;
+        }
+        let pass = core.execute_hidden_pass(now_ms);
+        assert!(
+            pass.pressure_events.is_empty(),
+            "retract fired at the derived AFD capacity"
+        );
+        completed += pass
+            .output_signals
+            .iter()
+            .filter(|signal| signal.completed)
+            .count();
+        now_ms = pass.end_ms;
+    }
+    assert_eq!(
+        completed, 24,
+        "every request must finish without retraction"
+    );
+}
+
+#[test]
+fn mtp_bursts_with_external_timing_provider() {
+    // The aic-afd injection route drives SglangCore through
+    // `PerfModel::External`; the speculative burst path must work unchanged
+    // with a provider-backed timing model.
+    struct FixedTiming;
+    impl crate::engine::TimingModel for FixedTiming {
+        fn predict_prefill_ms(&self, _: usize, _: usize, _: usize) -> anyhow::Result<f64> {
+            Ok(5.0)
+        }
+        fn predict_decode_ms(&self, _: usize, _: usize, _: usize, _: usize) -> anyhow::Result<f64> {
+            Ok(1.0)
+        }
+    }
+    let args = MockEngineArgs::builder()
+        .engine_type(EngineType::Sglang)
+        .num_gpu_blocks(32)
+        .block_size(4)
+        .speedup_ratio(0.0)
+        .aic_nextn(Some(2))
+        .aic_nextn_accept_rates(Some("1,1".to_string()))
+        .perf_model(std::sync::Arc::new(
+            crate::engine::common::perf_model::PerfModel::External {
+                timing: std::sync::Arc::new(FixedTiming),
+            },
+        ))
+        .sglang(Some(SglangArgs {
+            page_size: Some(4),
+            chunked_prefill_size: Some(16),
+            ..Default::default()
+        }))
+        .build()
+        .unwrap();
+    let mut core = SglangCore::new(args);
+    let first_id = Uuid::from_u128(201);
+    let second_id = Uuid::from_u128(202);
+    for (uuid, tokens) in [(first_id, vec![1, 2, 3, 4]), (second_id, vec![5, 6, 7, 8])] {
+        core.receive(DirectRequest {
+            tokens,
+            max_output_tokens: 8,
+            uuid: Some(uuid),
+            arrival_timestamp_ms: None,
+            ..Default::default()
+        });
+    }
+
+    // Prefill: one token per request, duration from the external provider.
+    let prefill = core.execute_hidden_pass(0.0);
+    assert_eq!(prefill.output_signals.len(), 2);
+    assert_eq!(prefill.end_ms, 5.0);
+
+    // Decode: full nextn+1 burst per request, provider decode duration.
+    let decode = core.execute_hidden_pass(prefill.end_ms);
+    let burst_counts = |pass: &crate::engine::scheduler::EnginePassResult, id: Uuid| {
+        pass.output_signals
+            .iter()
+            .filter(|signal| signal.uuid == id)
+            .count()
+    };
+    assert_eq!(burst_counts(&decode, first_id), 3);
+    assert_eq!(burst_counts(&decode, second_id), 3);
+    assert_eq!(decode.end_ms, 6.0);
+}
+
+#[rstest::rstest]
 fn rejects_prompt_at_or_above_max_model_len(
     #[values(8, 9)] prompt_len: u32,
     #[values(false, true)] handoff: bool,
