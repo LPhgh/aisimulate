@@ -583,6 +583,20 @@ impl Engine {
         &self.generation_ops
     }
 
+    /// Production accessor for the context op list. The AFD timing model
+    /// (`perfmodel::afd`) partitions and re-walks the compiled lists with its
+    /// own query shapes (uniform `x`, runtime `prefix`) instead of the
+    /// engine's whole-list phases.
+    pub(crate) fn context_ops(&self) -> &[Op] {
+        &self.context_ops
+    }
+
+    /// Production accessor for the generation op list. See
+    /// [`Self::context_ops`].
+    pub(crate) fn generation_ops(&self) -> &[Op] {
+        &self.generation_ops
+    }
+
     /// Python `run_static` / `run_static_latency_only` (`base_backend.py:347`,
     /// `:322`) restricted to the latency breakdown. Dispatches on `mode` the
     /// way `_run_static_breakdown` does and sums context + generation.

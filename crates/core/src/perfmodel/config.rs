@@ -111,7 +111,11 @@ pub const ENGINE_CONFIG_SCHEMA_VERSION: u32 = 1;
 // - 21 (AIC-1781): EngineConfig and MoeOp gained exact `moe_kernel_source`
 //   identity. Renumbered from the branch's concurrent v20 claim after the
 //   DeepSeek-V4.1 FPM layout landed first.
-pub const ENGINE_SPEC_SCHEMA_VERSION: u32 = 21;
+// - 22: Op gained the four AFD comm variants
+//   (AfdTransfer / AfdFAllGather / AfdFReduceScatter / AfdCombine), appended
+//   at the tail; the new serialized variants make old binaries unable to
+//   read AFD-carrying specs, so the version bumps despite tail-append.
+pub const ENGINE_SPEC_SCHEMA_VERSION: u32 = 22;
 
 /// Static engine identity and setup information carried by an
 /// [`crate::perfmodel::engine::spec::EngineSpec`].

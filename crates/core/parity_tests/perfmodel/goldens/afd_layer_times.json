@@ -1,0 +1,245 @@
+{
+ "cases": {
+  "qwen3-32b-h200-sglang-pure-both": {
+   "identity": {
+    "a_system": "h200_sxm",
+    "backend": "sglang",
+    "backend_version": "0.5.14",
+    "f_system": "h200_sxm",
+    "isl": 1024,
+    "model": "Qwen/Qwen3-32B",
+    "osl": 128,
+    "topology": {
+     "a_batch_size": 18,
+     "a_system": null,
+     "boundary_on_attn": true,
+     "combined_with_pd": false,
+     "comm_overhead_factor": 1.0,
+     "f_moe_ep_size": 1,
+     "f_system": null,
+     "gpus_per_node": 8,
+     "is_moe": false,
+     "n_a_nodes": 1,
+     "n_f_nodes": 1,
+     "num_experts": 0,
+     "num_microbatches": 3,
+     "phase": "both",
+     "pipeline_model": "optimistic",
+     "tp_a": 8
+    }
+   },
+   "phases": {
+    "decode": {
+     "a_to_f_ms": 0.0112288,
+     "attention_ms": 0.05861421567273679,
+     "f_to_a_ms": 0.0112288,
+     "ffn_ms": 0.05825024409261177,
+     "num_layers": 64
+    },
+    "prefill": {
+     "a_to_f_ms": 1.2682912,
+     "attention_ms": 0.458223175078198,
+     "f_to_a_ms": 1.2682912,
+     "ffn_ms": 0.916412761486026,
+     "num_layers": 64
+    }
+   }
+  },
+  "qwen3-32b-h200-trtllm-pd-decode": {
+   "identity": {
+    "a_system": "h200_sxm",
+    "backend": "trtllm",
+    "backend_version": "1.3.0rc20",
+    "f_system": "h200_sxm",
+    "isl": 1024,
+    "model": "Qwen/Qwen3-32B",
+    "osl": 128,
+    "topology": {
+     "a_batch_size": 64,
+     "a_system": null,
+     "boundary_on_attn": true,
+     "combined_with_pd": true,
+     "comm_overhead_factor": 1.0,
+     "f_moe_ep_size": 1,
+     "f_system": null,
+     "gpus_per_node": 8,
+     "is_moe": false,
+     "n_a_nodes": 1,
+     "n_f_nodes": 2,
+     "num_experts": 0,
+     "num_microbatches": 3,
+     "phase": "decode",
+     "pipeline_model": "optimistic",
+     "tp_a": 8
+    }
+   },
+   "phases": {
+    "decode": {
+     "a_to_f_ms": 0.012252800000000001,
+     "attention_ms": 0.06267708212204566,
+     "f_to_a_ms": 0.012252800000000001,
+     "ffn_ms": 0.04877429954775206,
+     "num_layers": 64
+    }
+   }
+  },
+  "qwen3-32b-h200-trtllm-pd-prefill": {
+   "identity": {
+    "a_system": "h200_sxm",
+    "backend": "trtllm",
+    "backend_version": "1.3.0rc20",
+    "f_system": "h200_sxm",
+    "isl": 1024,
+    "model": "Qwen/Qwen3-32B",
+    "osl": 128,
+    "topology": {
+     "a_batch_size": 64,
+     "a_system": null,
+     "boundary_on_attn": true,
+     "combined_with_pd": true,
+     "comm_overhead_factor": 1.0,
+     "f_moe_ep_size": 1,
+     "f_system": null,
+     "gpus_per_node": 8,
+     "is_moe": false,
+     "n_a_nodes": 1,
+     "n_f_nodes": 2,
+     "num_experts": 0,
+     "num_microbatches": 3,
+     "phase": "prefill",
+     "pipeline_model": "optimistic",
+     "tp_a": 8
+    }
+   },
+   "phases": {
+    "prefill": {
+     "a_to_f_ms": 2.3168672,
+     "attention_ms": 1.4991897011333826,
+     "f_to_a_ms": 2.3168672,
+     "ffn_ms": 1.5799789818355583,
+     "num_layers": 64
+    }
+   }
+  },
+  "qwen3-32b-h200-trtllm-pure-both": {
+   "identity": {
+    "a_system": "h200_sxm",
+    "backend": "trtllm",
+    "backend_version": "1.3.0rc20",
+    "f_system": "h200_sxm",
+    "isl": 1024,
+    "model": "Qwen/Qwen3-32B",
+    "osl": 128,
+    "topology": {
+     "a_batch_size": 18,
+     "a_system": null,
+     "boundary_on_attn": true,
+     "combined_with_pd": false,
+     "comm_overhead_factor": 1.0,
+     "f_moe_ep_size": 1,
+     "f_system": null,
+     "gpus_per_node": 8,
+     "is_moe": false,
+     "n_a_nodes": 1,
+     "n_f_nodes": 1,
+     "num_experts": 0,
+     "num_microbatches": 3,
+     "phase": "both",
+     "pipeline_model": "optimistic",
+     "tp_a": 8
+    }
+   },
+   "phases": {
+    "decode": {
+     "a_to_f_ms": 0.0112288,
+     "attention_ms": 0.06126769722822783,
+     "f_to_a_ms": 0.0112288,
+     "ffn_ms": 0.06084020703299543,
+     "num_layers": 64
+    },
+    "prefill": {
+     "a_to_f_ms": 1.2682912,
+     "attention_ms": 0.46361824477271635,
+     "f_to_a_ms": 1.2682912,
+     "ffn_ms": 0.9215771421964521,
+     "num_layers": 64
+    }
+   }
+  },
+  "qwen3-32b-h200a-b200f-trtllm-hetero-both": {
+   "composition": "attention_ms from the DB(a_system) run, ffn_ms from the DB(f_system) run (per-pool resolves from scratch, so no inherited quant mode leaks across pools). Transfer times are per-system references only; the cross-SKU fabric value follows the afd_comm.rs fabric model.",
+   "identity": {
+    "a_system": "h200_sxm",
+    "backend": "trtllm",
+    "backend_version": "1.3.0rc20",
+    "f_system": "b200_sxm",
+    "isl": 1024,
+    "model": "Qwen/Qwen3-32B",
+    "osl": 128,
+    "topology": {
+     "a_batch_size": 18,
+     "a_system": null,
+     "boundary_on_attn": true,
+     "combined_with_pd": false,
+     "comm_overhead_factor": 1.0,
+     "f_moe_ep_size": 1,
+     "f_system": null,
+     "gpus_per_node": 8,
+     "is_moe": false,
+     "n_a_nodes": 1,
+     "n_f_nodes": 1,
+     "num_experts": 0,
+     "num_microbatches": 3,
+     "phase": "both",
+     "pipeline_model": "optimistic",
+     "tp_a": 8
+    }
+   },
+   "phases": {
+    "decode": {
+     "attention_ms": 0.06126769722822783,
+     "ffn_ms": 0.05982058020836534,
+     "num_layers": 64
+    },
+    "prefill": {
+     "attention_ms": 0.46361824477271635,
+     "ffn_ms": 0.5587164123658006,
+     "num_layers": 64
+    }
+   },
+   "transfer_references": {
+    "decode": {
+     "a_to_f_ms": {
+      "b200_sxm": 0.0112288,
+      "h200_sxm": 0.0112288
+     },
+     "f_to_a_ms": {
+      "b200_sxm": 0.0112288,
+      "h200_sxm": 0.0112288
+     }
+    },
+    "prefill": {
+     "a_to_f_ms": {
+      "b200_sxm": 1.2682912,
+      "h200_sxm": 1.2682912
+     },
+     "f_to_a_ms": {
+      "b200_sxm": 1.2682912,
+      "h200_sxm": 1.2682912
+     }
+    }
+   }
+  }
+ },
+ "provenance": {
+  "communication_calibration": "unscaled (comm_overhead_factor=1.0 at measurement)",
+  "generator": "crates/core/parity_tests/perfmodel/gen_afd_oracle.py",
+  "git_head": "9cd9e8e98eeadb4825f62d0ea57140a906ee881b",
+  "source": "python-island aisimulate.sweeper.afd_measure.measure_afd_layer_times",
+  "tolerance": {
+   "relative": 1e-09
+  },
+  "units": "milliseconds_per_layer"
+ },
+ "schema_version": 1
+}

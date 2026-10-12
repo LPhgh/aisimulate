@@ -28,6 +28,7 @@ pub(crate) mod py_ops;
 // system_spec) with no AIC-domain knowledge. Top-level files (`config`,
 // `session`) and directories (`operators`, `perf_database`) carry the domain
 // logic the compiled `engine` executes.
+pub(crate) mod afd;
 pub(crate) mod common;
 pub(crate) mod config;
 pub mod engine;

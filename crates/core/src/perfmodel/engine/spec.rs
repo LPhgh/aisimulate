@@ -163,15 +163,16 @@ mod tests {
     use crate::common::enums::{
         BackendKind, CommQuantMode, FmhaQuantMode, GemmQuantMode, KvCacheQuantMode, MoeQuantMode,
     };
+    use crate::operators::afd_comm::AfdTransferDirection;
     use crate::operators::moe_dispatch::DispatchFlavor;
     use crate::operators::op::{FallbackOp, OverlapOp};
     use crate::operators::{
-        ContextAttentionOp, ContextMlaOp, CustomAllReduceOp, DsaModuleOp, Dsv4MegaMoeOp,
-        Dsv4ModuleOp, Dsv41AttentionOp, Dsv41EngramOp, Dsv41LinearOp, Dsv41MhcOp, Dsv41StageOp,
-        ElementwiseOp, EmbeddingOp, EncoderAttentionOp, GdnOp, GemmOp, GenerationAttentionOp,
-        GenerationMlaOp, KdaOp, Mamba2Op, MhcModuleOp, MlaBmmOp, MlaModuleOp, MoEDispatchOp,
-        MoeAllToAllOp, MoeExpertComputeOp, MoeOp, NcclOp, P2POp, VisionEncoderOp,
-        WideEpContextMlaOp, WideEpGenerationMlaOp,
+        AfdCombineOp, AfdFCollectiveOp, AfdTransferOp, ContextAttentionOp, ContextMlaOp,
+        CustomAllReduceOp, DsaModuleOp, Dsv4MegaMoeOp, Dsv4ModuleOp, Dsv41AttentionOp,
+        Dsv41EngramOp, Dsv41LinearOp, Dsv41MhcOp, Dsv41StageOp, ElementwiseOp, EmbeddingOp,
+        EncoderAttentionOp, GdnOp, GemmOp, GenerationAttentionOp, GenerationMlaOp, KdaOp, Mamba2Op,
+        MhcModuleOp, MlaBmmOp, MlaModuleOp, MoEDispatchOp, MoeAllToAllOp, MoeExpertComputeOp,
+        MoeOp, NcclOp, P2POp, VisionEncoderOp, WideEpContextMlaOp, WideEpGenerationMlaOp,
     };
     use crate::perf_database::dsv4::AttnKind;
     use crate::{
@@ -765,6 +766,37 @@ mod tests {
                 k: 5120,
                 quant_mode: GemmQuantMode::Fp8Block,
             }),
+            // Appended AFTER Dsv41Linear (schema 22): the four AFD comm
+            // variants. Tail-append keeps every earlier index stable.
+            OpSpec::AfdTransfer(AfdTransferOp {
+                name: "afd_transfer".into(),
+                scale_factor: 1.0,
+                direction: AfdTransferDirection::A2f,
+                hidden_size: 5120,
+                n_a_workers: 4,
+                n_f_workers: 16,
+                gpus_per_node: 8,
+                num_experts: 8,
+                topk: 2,
+                comm_quant_mode: crate::common::enums::CommQuantMode::Half,
+                comm_overhead_factor: 1.0,
+            }),
+            OpSpec::AfdFAllGather(AfdFCollectiveOp {
+                operation: "all_gather".into(),
+                ..AfdFCollectiveOp::all_gather("afd_f_all_gather", 1.0)
+            }),
+            OpSpec::AfdFReduceScatter(AfdFCollectiveOp {
+                operation: "reduce_scatter".into(),
+                ..AfdFCollectiveOp::reduce_scatter("afd_f_reduce_scatter", 1.0)
+            }),
+            OpSpec::AfdCombine(AfdCombineOp {
+                name: "afd_combine".into(),
+                scale_factor: 1.0,
+                hidden_size: 5120,
+                tp_a: 8,
+                f_moe_ep_size: 4,
+                comm_quant_mode: crate::common::enums::CommQuantMode::Half,
+            }),
         ];
 
         // Exhaustiveness guard: if a variant is added to `Op`, this match
@@ -811,6 +843,10 @@ mod tests {
                 | OpSpec::Dsv41Engram(_)
                 | OpSpec::Dsv41Stage(_)
                 | OpSpec::Dsv41Linear(_)
+                | OpSpec::AfdTransfer(_)
+                | OpSpec::AfdFAllGather(_)
+                | OpSpec::AfdFReduceScatter(_)
+                | OpSpec::AfdCombine(_)
                 | OpSpec::TokenScale(_) => {}
             }
         }
@@ -905,15 +941,16 @@ mod tests {
         // Appending is the only safe growth direction.
         assert_eq!(MOE_EXPERT_COMPUTE_INDEX, MOE_ALL_TO_ALL_INDEX + 1);
         assert_eq!(TOKEN_SCALE_INDEX, MOE_EXPERT_COMPUTE_INDEX + 1);
-        // Keep the main-branch TokenScale index; V41 variants append after it.
+        // Keep the main-branch TokenScale index; V41 variants append after it,
+        // and the four schema-22 AFD comm variants append after V41.
         let appended: Vec<_> = all_op_variants().iter().skip(36).map(index_of).collect();
         assert_eq!(
             appended,
-            vec![36, 37, 38, 39, 40],
-            "V41 appended indices moved"
+            vec![36, 37, 38, 39, 40, 41, 42, 43, 44],
+            "V41 + AFD appended indices moved"
         );
         assert_eq!(
-            TOKEN_SCALE_INDEX as usize + 6,
+            TOKEN_SCALE_INDEX as usize + 10,
             all_op_variants().len(),
             "all_op_variants() must cover exactly the pinned variant count"
         );
@@ -997,7 +1034,7 @@ mod tests {
             vec![OpSpec::FpmForward(fpm_forward())],
             vec![OpSpec::Moe(moe())],
         );
-        assert_eq!(spec.schema_version, 21);
+        assert_eq!(spec.schema_version, ENGINE_SPEC_SCHEMA_VERSION);
         let mut bytes = spec.to_bincode().unwrap();
         assert_eq!(EngineSpec::from_bincode(&bytes).unwrap(), spec);
 
