@@ -459,16 +459,16 @@
       },
       "expected": {
         "completed_requests": 4,
-        "duration_ms": 46.764711000000005,
-        "mean_tpot_ms": 4.8529542857142856,
+        "duration_ms": 58.088271000000006,
+        "mean_tpot_ms": 5.66178,
         "mean_ttft_ms": 12.794031,
         "total_input_tokens": 512,
         "total_output_tokens": 32
       },
       "generation": {
-        "baseline_commit": "6b57265e03a3844503b6a9f77f29f1f2dd8eea02",
-        "binary_sha256": "ffd6f19910670a32001382c5cba7490e3bfe540b7308df406dedb648b682812e",
-        "build_command": "PYO3_PYTHON=<venv>/bin/python cargo rustc -p aisimulate-core --release --features extension-module --offline -- -C link-arg=-undefined -C link-arg=dynamic_lookup",
+        "baseline_commit": "444c71d55a66b5bc50ea4ddab30e69a024c30525",
+        "binary_sha256": "3a8453d5df53c1776504f145ae0f92eeffe2b71eb908a3c1c5d2c13546425b6b",
+        "build_command": "PYO3_PYTHON=<venv>/bin/python CARGO_TARGET_DIR=<shared-target> cargo rustc -p aisimulate-core --release --features extension-module --offline -- -C link-arg=-undefined -C link-arg=dynamic_lookup",
         "command": [
           "aisimulate",
           "predict",
@@ -482,18 +482,49 @@
           "json"
         ],
         "config_sha256": "88224c67eaf742054e69353def7427601f1d04393b6ae150b84fe57d35a05402",
-        "data_tree": "40309de023ff69daa42589ca958a382c704cf576",
+        "data_tree": "9ef95689f6a8966c279cf67aeba25cdbe9db412d",
         "features": [
           "extension-module"
         ],
-        "native_source_commit": "4849d6676280aafe963d795a757d087a24d8f8a7",
-        "reason": "Conserve actual replica/microbatch token populations and schedule return combine, shared merge and token all-gather on A after transfer; preserve source-layer dependencies and shared hardware precision resolution. Request/token/GPU accounting remains unchanged.",
-        "source_commit": "7392d688601c99c5048fba27c70547a586495c2c",
-        "source_tree": "b3bbc557dc6d0f54f9ef0de5ab734ea929da8617",
+        "main_commit": "e8cbe2dc150f0df309993474842c2e417753873d",
+        "native_source_commit": "d139f3646774dced5be67d3c20f3c51cde11ba72",
+        "reason": "Integrate main 18d71dcd (#637): shared speculative sampler changes from StdRng to SmallRng, so the fixed-seed acceptance stream changes. Integrated baseline 444c71d5 and candidate d139f364 produce identical results; request/token counts and TTFT remain unchanged. This is an upstream RNG-stream change, not an AFD timing-model change.",
+        "source_commit": "d139f3646774dced5be67d3c20f3c51cde11ba72",
+        "source_tree": "ad8d1f0324ec2878c95fb1bb8d107c562661e94d",
         "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)",
         "trace_sha256": null
       },
-      "modeling_change": "Conserve actual replica/microbatch token populations and schedule return combine, shared merge and token all-gather on A after transfer; preserve source-layer dependencies and shared hardware precision resolution. Request/token/GPU accounting remains unchanged.",
+      "historical_generations": [
+        {
+          "baseline_commit": "6b57265e03a3844503b6a9f77f29f1f2dd8eea02",
+          "binary_sha256": "ffd6f19910670a32001382c5cba7490e3bfe540b7308df406dedb648b682812e",
+          "build_command": "PYO3_PYTHON=<venv>/bin/python cargo rustc -p aisimulate-core --release --features extension-module --offline -- -C link-arg=-undefined -C link-arg=dynamic_lookup",
+          "command": [
+            "aisimulate",
+            "predict",
+            "--stack",
+            "engine",
+            "--config",
+            "<generated-layout.yaml>",
+            "--output-dir",
+            "<temporary>",
+            "--format",
+            "json"
+          ],
+          "config_sha256": "88224c67eaf742054e69353def7427601f1d04393b6ae150b84fe57d35a05402",
+          "data_tree": "40309de023ff69daa42589ca958a382c704cf576",
+          "features": [
+            "extension-module"
+          ],
+          "native_source_commit": "4849d6676280aafe963d795a757d087a24d8f8a7",
+          "reason": "Conserve actual replica/microbatch token populations and schedule return combine, shared merge and token all-gather on A after transfer; preserve source-layer dependencies and shared hardware precision resolution. Request/token/GPU accounting remains unchanged.",
+          "source_commit": "7392d688601c99c5048fba27c70547a586495c2c",
+          "source_tree": "b3bbc557dc6d0f54f9ef0de5ab734ea929da8617",
+          "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)",
+          "trace_sha256": null
+        }
+      ],
+      "modeling_change": "Integrate main 18d71dcd (#637): shared speculative sampler changes from StdRng to SmallRng, so the fixed-seed acceptance stream changes. Integrated baseline 444c71d5 and candidate d139f364 produce identical results; request/token counts and TTFT remain unchanged. This is an upstream RNG-stream change, not an AFD timing-model change.",
       "oracle": "Native replay with nextn=3; injected communication work is 17/16 for 48 target layers, independently anchored by Rust MTP communication tests.",
       "trace": false
     },
@@ -797,16 +828,16 @@
       },
       "expected": {
         "completed_requests": 4,
-        "duration_ms": 43.45337,
-        "mean_tpot_ms": 4.3765152857142855,
+        "duration_ms": 53.665239,
+        "mean_tpot_ms": 5.1059345,
         "mean_ttft_ms": 12.817763,
         "total_input_tokens": 512,
         "total_output_tokens": 32
       },
       "generation": {
-        "baseline_commit": "6b57265e03a3844503b6a9f77f29f1f2dd8eea02",
-        "binary_sha256": "ffd6f19910670a32001382c5cba7490e3bfe540b7308df406dedb648b682812e",
-        "build_command": "PYO3_PYTHON=<venv>/bin/python cargo rustc -p aisimulate-core --release --features extension-module --offline -- -C link-arg=-undefined -C link-arg=dynamic_lookup",
+        "baseline_commit": "444c71d55a66b5bc50ea4ddab30e69a024c30525",
+        "binary_sha256": "3a8453d5df53c1776504f145ae0f92eeffe2b71eb908a3c1c5d2c13546425b6b",
+        "build_command": "PYO3_PYTHON=<venv>/bin/python CARGO_TARGET_DIR=<shared-target> cargo rustc -p aisimulate-core --release --features extension-module --offline -- -C link-arg=-undefined -C link-arg=dynamic_lookup",
         "command": [
           "aisimulate",
           "predict",
@@ -820,18 +851,49 @@
           "json"
         ],
         "config_sha256": "15963a9b45b3eba436e5a4db5f9329f937c1dca39d045f52498783e59ef208cc",
-        "data_tree": "40309de023ff69daa42589ca958a382c704cf576",
+        "data_tree": "9ef95689f6a8966c279cf67aeba25cdbe9db412d",
         "features": [
           "extension-module"
         ],
-        "native_source_commit": "4849d6676280aafe963d795a757d087a24d8f8a7",
-        "reason": "Conserve actual replica/microbatch token populations and schedule return combine, shared merge and token all-gather on A after transfer; preserve source-layer dependencies and shared hardware precision resolution. Request/token/GPU accounting remains unchanged.",
-        "source_commit": "7392d688601c99c5048fba27c70547a586495c2c",
-        "source_tree": "b3bbc557dc6d0f54f9ef0de5ab734ea929da8617",
+        "main_commit": "e8cbe2dc150f0df309993474842c2e417753873d",
+        "native_source_commit": "d139f3646774dced5be67d3c20f3c51cde11ba72",
+        "reason": "Integrate main 18d71dcd (#637): shared speculative sampler changes from StdRng to SmallRng, so the fixed-seed acceptance stream changes. Integrated baseline 444c71d5 and candidate d139f364 produce identical results; request/token counts and TTFT remain unchanged. This is an upstream RNG-stream change, not an AFD timing-model change.",
+        "source_commit": "d139f3646774dced5be67d3c20f3c51cde11ba72",
+        "source_tree": "ad8d1f0324ec2878c95fb1bb8d107c562661e94d",
         "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)",
         "trace_sha256": null
       },
-      "modeling_change": "Conserve actual replica/microbatch token populations and schedule return combine, shared merge and token all-gather on A after transfer; preserve source-layer dependencies and shared hardware precision resolution. Request/token/GPU accounting remains unchanged.",
+      "historical_generations": [
+        {
+          "baseline_commit": "6b57265e03a3844503b6a9f77f29f1f2dd8eea02",
+          "binary_sha256": "ffd6f19910670a32001382c5cba7490e3bfe540b7308df406dedb648b682812e",
+          "build_command": "PYO3_PYTHON=<venv>/bin/python cargo rustc -p aisimulate-core --release --features extension-module --offline -- -C link-arg=-undefined -C link-arg=dynamic_lookup",
+          "command": [
+            "aisimulate",
+            "predict",
+            "--stack",
+            "engine",
+            "--config",
+            "<generated-layout.yaml>",
+            "--output-dir",
+            "<temporary>",
+            "--format",
+            "json"
+          ],
+          "config_sha256": "15963a9b45b3eba436e5a4db5f9329f937c1dca39d045f52498783e59ef208cc",
+          "data_tree": "40309de023ff69daa42589ca958a382c704cf576",
+          "features": [
+            "extension-module"
+          ],
+          "native_source_commit": "4849d6676280aafe963d795a757d087a24d8f8a7",
+          "reason": "Conserve actual replica/microbatch token populations and schedule return combine, shared merge and token all-gather on A after transfer; preserve source-layer dependencies and shared hardware precision resolution. Request/token/GPU accounting remains unchanged.",
+          "source_commit": "7392d688601c99c5048fba27c70547a586495c2c",
+          "source_tree": "b3bbc557dc6d0f54f9ef0de5ab734ea929da8617",
+          "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)",
+          "trace_sha256": null
+        }
+      ],
+      "modeling_change": "Integrate main 18d71dcd (#637): shared speculative sampler changes from StdRng to SmallRng, so the fixed-seed acceptance stream changes. Integrated baseline 444c71d5 and candidate d139f364 produce identical results; request/token counts and TTFT remain unchanged. This is an upstream RNG-stream change, not an AFD timing-model change.",
       "oracle": "Native replay with nextn=3; injected communication work is 17/16 for 48 target layers, independently anchored by Rust MTP communication tests.",
       "trace": false
     },
