@@ -884,6 +884,10 @@ def test_prefill_memory_rejects_oom_for_synthetic_and_trace(tmp_path, trace, fro
         )
         raw["traffic"]["source"] = {"type": "trace", "paths": [str(path)], "format": "mooncake"}
         raw["traffic"].pop("stop")
+    if trace and frozen:
+        with pytest.raises(ValueError, match="frozen_decode_identity=true is unsupported"):
+            prediction_to_replay_spec(CorePredictionConfig.model_validate(raw))
+        return
     spec = prediction_to_replay_spec(CorePredictionConfig.model_validate(raw))
     # The F pool has 6.75 GiB of routed weights. A 1024-token prefill needs
     # another 5.52 GiB for activations, workspace and fixed reservations;

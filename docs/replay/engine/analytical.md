@@ -129,8 +129,8 @@ AFD uses continuous SGLang request replay, with analytical timing for each A/F
 pass. Prefill uses the actual batch and uncached suffix. Fixed synthetic decode
 uses frozen full-batch, stride-averaged timing; variable traffic uses the current
 batch and KV position. To pin either choice, set
-`engine.estimator_config.afd.frozen_decode_identity` to `true` or `false`;
-omission/null preserves this workload-derived default. The resolved choice is
+`engine.estimator_config.afd.frozen_decode_identity` to `true` or `false` for synthetic traffic;
+omission/null preserves this workload-derived default. Trace, session and agentic sources reject explicit `true` because their reference ISL/OSL can be placeholders; use `false` or omit the setting. The resolved choice is
 saved in replay identity. See [the configuration fields](../../perf-model/configuration.md#unified-cli-timing-fields)
 and [pipeline and batch pricing](../../sweeper/afd-topology.md#staged-evaluation)
 for dense-prefix execution, microbatch splitting and stage timelines.

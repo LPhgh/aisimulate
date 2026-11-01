@@ -626,7 +626,7 @@ concrete-only.
 
 | Knob | Default | Default Range | Preset | Rules |
 |---|---:|---|---|---|
-| `engine.estimator_config.afd.frozen_decode_identity` | `null` | `x` | `-` | AFD-only decode pricing override: `true` freezes the stride-averaged identity, `false` prices the current pass. Unset/null chooses from workload geometry in Rust; resolved identity is saved before replay hashing. |
+| `engine.estimator_config.afd.frozen_decode_identity` | `null` | `x` | `-` | AFD-only decode pricing override: `true` freezes the stride-averaged synthetic identity (rejected for trace/session/agentic sources), `false` prices the current pass. Unset/null chooses from workload geometry in Rust; resolved identity is saved before replay hashing. |
 | `engine.estimation_mode` | `auto` | `x` | `-` | `auto`, `op_level`, `fpm_interpolation`, or `fpm_regression`. `fpm_learned` is rejected by prediction and recommendation configuration validation. |
 | `engine.workers.<role>.timing.estimation_mode` | `null` | `x` | `-` | Optional role override using the same four modes; omission inherits the global selection. `fpm_learned` is rejected here too. |
 | `engine.workers.<role>.timing.type` | `default` | `x` | `-` | `default`, `fixed`, or `polynomial`. |
@@ -639,7 +639,9 @@ AFD decode pricing is configured through `engine.estimator_config.afd` in both
 prediction and recommendation. `frozen_decode_identity` accepts a boolean or
 `null`: omission/null retains frozen pricing for fixed-length synthetic traffic
 and instantaneous pricing for variable-length, trace, session or agentic traffic.
-An explicit boolean pins that choice for calibration. The compiler records the
+An explicit boolean pins that choice for synthetic calibration. Trace, session and
+agentic sources reject explicit `true`, even in saved specifications, because their
+reference ISL/OSL may be placeholders; use `false` or omit the setting. The compiler records the
 Rust-resolved value in every AFD role's replay metadata before hashing and saving;
 reload validates it against the same configuration and workload. The former
 `AISIMULATE_AFD_FROZEN_DECODE_IDENTITY` environment override is no longer read.

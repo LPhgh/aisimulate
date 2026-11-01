@@ -143,6 +143,11 @@ def test_pricing_identity_is_pinned_saved_and_independent_of_environment(
     for metadata in spec.backend_deployment.performance_model_metadata.values():
         metadata["estimator"] = {"estimator_config": {"afd": {"frozen_decode_identity": explicit}}}
     original = canonical_json(spec)
+    if explicit is True and workload.get("source_type") in ("trace", "synthetic-session"):
+        with pytest.raises(ValueError, match="frozen_decode_identity=true is unsupported"):
+            resolve_afd_replay_identity(spec)
+        assert canonical_json(spec) == original
+        return
     resolved = resolve_afd_replay_identity(spec)
     assert canonical_json(spec) == original
     assert resolve_afd_replay_identity(resolved) is resolved

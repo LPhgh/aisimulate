@@ -1204,17 +1204,21 @@ impl EstimatorConfig {
                 "random_range_ratio must be finite and in (0.0, 1.0]".into(),
             ));
         }
-        let variable = workload.trace_path.is_some()
+        let placeholder_lengths = workload.trace_path.is_some()
             || workload
                 .source_type
                 .as_deref()
-                .is_some_and(|kind| kind != "synthetic")
-            || ratio != 1.0;
-        Ok(self
+                .is_some_and(|kind| kind != "synthetic");
+        let explicit = self
             .afd
             .as_ref()
-            .and_then(|config| config.frozen_decode_identity)
-            .unwrap_or(!variable))
+            .and_then(|config| config.frozen_decode_identity);
+        if placeholder_lengths && explicit == Some(true) {
+            return Err(AicError::InvalidEngineConfig(
+                "afd.frozen_decode_identity=true is unsupported for trace/session/agentic traffic: reference ISL/OSL may be placeholders; use false or omit the setting".into(),
+            ));
+        }
+        Ok(explicit.unwrap_or(!placeholder_lengths && ratio == 1.0))
     }
 
     pub(crate) fn resolve_defaults(&mut self) {
@@ -1963,12 +1967,24 @@ mod tests {
                     "afd": {"frozen_decode_identity": explicit},
                 }))
                 .unwrap();
-                assert_eq!(
-                    config
+                let trace_like = workload.get("trace_path").is_some()
+                    || workload
+                        .get("source_type")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|kind| kind != "synthetic");
+                if trace_like && explicit == Some(true) {
+                    let error = config
                         .resolve_afd_decode_identity(workload.clone())
-                        .unwrap(),
-                    explicit.unwrap_or(frozen)
-                );
+                        .unwrap_err();
+                    assert!(error.to_string().contains("use false or omit"));
+                } else {
+                    assert_eq!(
+                        config
+                            .resolve_afd_decode_identity(workload.clone())
+                            .unwrap(),
+                        explicit.unwrap_or(frozen)
+                    );
+                }
                 let saved = serde_json::to_value(&config).unwrap();
                 assert_eq!(
                     serde_json::from_value::<EstimatorConfig>(saved).unwrap(),
